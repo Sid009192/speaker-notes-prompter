@@ -4,6 +4,16 @@ import ctypes, re, sys, os, threading, json, time, asyncio
 
 WDA_EXCLUDEFROMCAPTURE = 0x00000011
 
+
+def _app_dir():
+    """Directory to treat as 'next to overlay.py' — the real folder holding
+    the .exe when frozen by PyInstaller (onefile extracts __file__ into a
+    throwaway _MEIPASS temp dir, which is NOT where .env / vosk models live),
+    otherwise the script's own folder for normal `python overlay.py` runs."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
 # ── ALEXANDRIA COLOR TOKENS ──────────────────────────────────────────────────
 C = {
     "bg":       "#141314",   # outer window bg
@@ -17,6 +27,7 @@ C = {
     "muted":    "#565966",   # prev/next preview text
     "outline":  "#434653",   # separators
     "tertiary": "#dcc661",   # archival gold
+    "gold":     "#dcc661",   # alias for tertiary
     "red":      "#ff5f56",
     "yellow":   "#ffbd2e",
     "green":    "#27c93f",
@@ -30,9 +41,13 @@ LABEL = "Public Sans"
 
 class OverlayApp:
 
+    # Default right-side hint in the copilot transcript pane (replaced by the live
+    # partial words while editing the pending question).
+    _COPILOT_TR_HINT = "click to edit  ·  Enter answer  ·  F10 new chat"
+
     def __init__(self, root):
         self.root      = root
-        self.slides    = ["# Welcome\n\nOpen a file via ⚙  or connect to sync."]
+        self.slides    = [""]                # blank body until notes load / sync
         self.current   = 0
         self.font_size = 12
 
@@ -43,9 +58,16 @@ class OverlayApp:
         self._firebase_url  = ""         # last connected Firebase URL
         self._last_synced   = None       # last content seen/sent over sync (echo guard)
         self._edit_guard_until = 0       # ignore inbound sync briefly after a local edit
-        self._fb_last_ok    = 0          # time of last successful Firebase poll (badge health)
+        self._fb_last_ok    = 0          # time of last Firebase stream activity
+        self._fb_streams    = set()      # Firebase nodes whose push stream is connected
+        self._http          = None       # keep-alive requests.Session for Firebase writes
+        self._fb_put_lock    = threading.Lock()  # guards the single-writer slot below
+        self._fb_put_pending = None      # newest content waiting to be PUT
+        self._fb_put_busy    = False     # writer thread running
+        self._remote_latest = None       # newest remote content (retried after a local edit)
         self._fb_presence_val = None     # last phone heartbeat value seen
         self._fb_presence_at  = 0        # local time that heartbeat last changed (peer-present)
+        self._last_cmd_ts     = 0        # timestamp of the last processed remote command
         self._editing       = False      # active-card edit mode flag
         self._live_after    = None       # debounce id for live edit broadcasts
         self._ws_clients    = set()      # connected local-WS clients
@@ -55,6 +77,14 @@ class OverlayApp:
         self._logs_frame    = None
         self._elapsed       = 0
         self._live_state    = True
+
+        self._imgs          = []         # live tk image refs for the active card (GC guard)
+        self._img_store     = {}         # image token store: "1" -> data URL (prevents raw bytes in editor)
+        self._img_cache     = {}         # decoded/resized tk images keyed by (src, size)
+        self._readonly      = False      # read-only presenter mode (locks click-to-edit)
+        self._hidden        = False      # overlay hidden via the global show/hide hotkey
+        self._hotkey_id     = None       # id of the registered Win32 global hotkey
+        self._hotkey_thread = None       # daemon thread running the hotkey message loop
 
         self._autoscroll_active   = False
         self._autoscroll_words    = []   # parallel: (start_idx, end_idx) tk positions
@@ -68,6 +98,29 @@ class OverlayApp:
         self._voice_version       = 0    # increments to cancel old mic threads
         self._voice_spoken_count  = 0    # words consumed from the current partial
 
+        # ── AI copilot (local, on-device) ──
+        self._copilot           = None   # CopilotEngine instance (lazy)
+        self._copilot_active    = False
+        self._copilot_status    = "idle"
+        self._copilot_transcript = []    # rolling transcript snapshot (list[str])
+        self._copilot_question  = ""     # question currently being answered
+        self._copilot_answer    = ""     # accumulated streamed answer
+        self._copilot_hotkey    = False  # global F9 hook registered?
+        self._copilot_hotkey_handle = None  # handle from keyboard.add_hotkey
+        self._copilot_audio_rms = 0.0    # latest loopback RMS (audio-activity meter)
+        self._copilot_audio_at  = 0.0    # monotonic time of last audio frame
+        self._copilot_device    = ""     # captured device name (for diagnostics)
+        self._copilot_last_heard = ""    # most recent transcript snippet (liveness)
+        self._copilot_pane      = None   # live-transcript pane (built lazily)
+        self._copilot_tr_text   = None   # the transcript tk.Text inside the pane
+        self._copilot_tr_hint   = None   # right-side hint / live-words label in pane
+        self._copilot_lines     = []     # finalized transcript lines (pane display)
+        self._copilot_partial   = ""     # in-progress partial (live words)
+        self._copilot_answer_epoch = 0   # generation id (drops stale aborted tokens)
+        self._copilot_editing   = False  # editing the pending-question panel?
+        self._copilot_think_open  = False  # THINKING section started this answer?
+        self._copilot_answer_open = False  # ANSWER section started this answer?
+
         self._user32 = ctypes.WinDLL("user32", use_last_error=True)
 
         self._setup_window()
@@ -77,19 +130,43 @@ class OverlayApp:
         self.render_slide()
         self._tick_timer()
         self.root.focus_force()
+        self._register_global_hotkey()
 
     # ── WINDOW ───────────────────────────────────────────────────────────────
 
     def _setup_window(self):
+        self.root.title("AsusServiceOLED")
         self.root.overrideredirect(True)
         self.root.attributes("-topmost", True)
         self.root.attributes("-alpha", 0.93)
         self.root.geometry("700x500+150+100")
         self.root.configure(bg=C["bg"])
         self.root.minsize(MIN_W, MIN_H)
+        self._apply_stealth_style(self.root)
+
+    def _apply_stealth_style(self, window=None):
+        """Ensure the window has WS_EX_TOOLWINDOW and no WS_EX_APPWINDOW
+        so it never appears on the taskbar, in the tray, or in Alt+Tab,
+        and Windows Task Manager classifies it under Background Processes."""
+        if window is None:
+            window = self.root
+        try:
+            window.update_idletasks()
+            inner = window.winfo_id()
+            hwnd  = ctypes.windll.user32.GetParent(inner) or inner
+            GWL_EXSTYLE = -20
+            WS_EX_TOOLWINDOW = 0x00000080
+            WS_EX_APPWINDOW  = 0x00040000
+            style = self._user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+            style = (style | WS_EX_TOOLWINDOW) & ~WS_EX_APPWINDOW
+            self._user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            self._user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, 0x0027)
+        except Exception:
+            pass
 
     def _cloak(self, window):
         window.update()
+        self._apply_stealth_style(window)
         inner = window.winfo_id()
         hwnd  = ctypes.windll.user32.GetParent(inner) or inner
         ret   = self._user32.SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE)
@@ -99,15 +176,39 @@ class OverlayApp:
                   f"(HWND={hwnd:#x}, error={err}). "
                   "The overlay may be visible in screen shares.")
 
-    def _minimize(self):
-        """Minimize via the overrideredirect toggle trick."""
-        self.root.overrideredirect(False)
-        self.root.iconify()
-        self.root.bind("<Map>", self._on_restore)
+    def _quit(self):
+        """Tear down background workers (copilot engine + global F9 hook + STT
+        child processes) before destroying the window, so nothing is orphaned."""
+        if getattr(self, "_quitting", False):
+            return                       # idempotent — ignore a second close event
+        self._quitting = True
+        try:
+            if self._copilot_active:
+                self._stop_copilot(set_notes_tab=False)
+        except Exception as e:           # noqa: BLE001 — never let cleanup block close
+            print(f"[Copilot] teardown error on quit: {type(e).__name__}: {e}")
+        finally:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass                     # already destroyed
 
-    def _on_restore(self, event):
-        self.root.overrideredirect(True)
-        self.root.unbind("<Map>")
+    def _minimize(self):
+        """Collapse or expand the overlay smoothly without ever touching the taskbar."""
+        if getattr(self, "_collapsed", False):
+            self._collapsed = False
+            h = getattr(self, "_saved_height", 500)
+            self.root.minsize(MIN_W, MIN_H)
+            if hasattr(self, "_body"):
+                self._body.pack(fill="both", expand=True)
+            self.root.geometry(f"{self.root.winfo_width()}x{h}+{self.root.winfo_x()}+{self.root.winfo_y()}")
+        else:
+            self._collapsed = True
+            self._saved_height = max(self.root.winfo_height(), MIN_H)
+            if hasattr(self, "_body"):
+                self._body.pack_forget()
+            self.root.minsize(MIN_W, 44)
+            self.root.geometry(f"{self.root.winfo_width()}x44+{self.root.winfo_x()}+{self.root.winfo_y()}")
         self._cloak(self.root)
 
     # ── UI BUILD ─────────────────────────────────────────────────────────────
@@ -131,16 +232,18 @@ class OverlayApp:
         left.bind("<ButtonPress-1>", self._start_drag)
         left.bind("<B1-Motion>",     self._do_drag)
 
-        for color, symbol, cmd in [
-            (C["red"],    "✕", self.root.destroy),
-            (C["yellow"], "−", self._minimize),
-            (C["green"],  "●", lambda: None),
+        # Muted window controls — same grey as separators, so they don't pull
+        # the eye away from the notes.
+        for symbol, cmd in [
+            ("✕", self._quit),
+            ("−", self._minimize),
+            ("●", self._minimize),
         ]:
-            dot = tk.Frame(left, bg=color, width=16, height=16,
+            dot = tk.Frame(left, bg=C["outline"], width=16, height=16,
                            cursor="hand2")
             dot.pack(side="left", padx=3)
             dot.pack_propagate(False)
-            lbl = tk.Label(dot, text=symbol, bg=color, fg=C["bar"],
+            lbl = tk.Label(dot, text=symbol, bg=C["outline"], fg=C["on_sv"],
                            font=(SANS, 8, "bold"), cursor="hand2")
             lbl.place(relx=0.5, rely=0.5, anchor="center")
             for w in (dot, lbl):
@@ -155,6 +258,11 @@ class OverlayApp:
         title.bind("<ButtonPress-1>", self._start_drag)
         title.bind("<B1-Motion>",     self._do_drag)
 
+        # Read-only indicator: just "R", packed only while read-only (click = exit)
+        self._ro_badge = tk.Label(left, text="R", bg=C["gold"], fg=C["bar"],
+                                  font=(LABEL, 8, "bold"), padx=5, cursor="hand2")
+        self._ro_badge.bind("<Button-1>", lambda e: self._toggle_readonly())
+
         # Right cluster
         right = tk.Frame(bar, bg=C["bar"])
         right.pack(side="right", padx=(0, 14))
@@ -165,6 +273,25 @@ class OverlayApp:
             activebackground=C["bar"], activeforeground=C["primary"],
             relief="flat", command=self._open_settings)
         self._gear_btn.pack(side="right", padx=(6, 0))
+
+        # ── QUICK VISIBILITY / OPACITY SLIDER ──
+        op_f = tk.Frame(right, bg=C["bar"])
+        op_f.pack(side="right", padx=(6, 10))
+        tk.Label(op_f, text="👁", bg=C["bar"], fg=C["on_sv"],
+                 font=(SANS, 10)).pack(side="left", padx=(0, 2))
+        curr_alpha = int(round(self.root.attributes("-alpha") * 100)) if self.root.attributes("-alpha") else 95
+        self._top_op_label = tk.Label(op_f, text=f"{curr_alpha}%", bg=C["bar"],
+                                      fg=C["on_sv"], font=(LABEL, 8, "bold"),
+                                      width=4, anchor="w")
+        self._top_op_label.pack(side="left")
+        self._top_op_scale = tk.Scale(
+            op_f, from_=0, to=100, orient="horizontal",
+            showvalue=False, length=64, width=12, sliderlength=14,
+            bg=C["bar"], troughcolor=C["card_act"], highlightthickness=0,
+            bd=0, sliderrelief="flat", activebackground=C["primary"],
+            cursor="hand2", command=self._on_opacity)
+        self._top_op_scale.set(curr_alpha)
+        self._top_op_scale.pack(side="left", padx=(2, 0))
 
         tk.Frame(right, bg=C["outline"], width=1).pack(
             side="right", fill="y", pady=10, padx=8)
@@ -190,10 +317,10 @@ class OverlayApp:
     # ── BODY ─────────────────────────────────────────────────────────────────
 
     def _build_body(self):
-        body = tk.Frame(self.root, bg=C["bg"])
-        body.pack(fill="both", expand=True)
-        self._build_sidebar(body)
-        self._build_main_column(body)
+        self._body = tk.Frame(self.root, bg=C["bg"])
+        self._body.pack(fill="both", expand=True)
+        self._build_sidebar(self._body)
+        self._build_main_column(self._body)
 
     # ── SIDEBAR ──────────────────────────────────────────────────────────────
 
@@ -201,6 +328,7 @@ class OverlayApp:
         sb = tk.Frame(parent, bg=C["bar"], width=72)
         sb.pack(side="left", fill="y")
         sb.pack_propagate(False)
+        self._sidebar = sb
 
         self._active_tab  = "notes"
         self._tab_widgets = {}
@@ -227,8 +355,9 @@ class OverlayApp:
             for w in (wrap, icon_f, icon_l, name_l):
                 w.bind("<Button-1>", click)
 
-        make_tab("✏", "NOTES", "notes", self._show_notes)
-        make_tab("≡", "LOGS",  "logs",  self._toggle_logs_panel)
+        make_tab("✏", "NOTES",   "notes",   self._show_notes)
+        make_tab("≡", "LOGS",    "logs",    self._toggle_logs_panel)
+        make_tab("✦", "COPILOT", "copilot", self._toggle_copilot)
 
         hf = tk.Frame(sb, bg=C["bar"], cursor="hand2")
         hf.pack(side="bottom", pady=12)
@@ -236,6 +365,10 @@ class OverlayApp:
                  font=(LABEL, 12, "bold")).pack()
 
     def _set_active_tab(self, name):
+        # Leaving the copilot tab tears the pipeline down (without re-grabbing
+        # the tab we're in the middle of switching to).
+        if name != "copilot" and self._copilot_active:
+            self._stop_copilot(set_notes_tab=False)
         self._active_tab = name
         for n, (icon_f, icon_l, name_l) in self._tab_widgets.items():
             a = (n == name)
@@ -264,6 +397,7 @@ class OverlayApp:
         bar = tk.Frame(parent, bg=C["bar"], height=40)
         bar.pack(fill="x")
         bar.pack_propagate(False)
+        self._statusbar = bar
 
         self._breadcrumb = tk.Label(bar, text="",
                                     bg=C["bar"], fg=C["outline"],
@@ -283,7 +417,15 @@ class OverlayApp:
                   side="left", padx=(0, 2))
         tk.Button(right, text="A+",
                   command=lambda: self._change_font(1),  **_b).pack(
-                  side="left", padx=(0, 10))
+                  side="left", padx=(0, 8))
+
+        self._readonly_btn = tk.Button(
+            right, text="EDITABLE", command=self._toggle_readonly,
+            bg="#252829", fg="#ffffff", bd=1, relief="solid",
+            font=(SANS, 8, "bold"), cursor="hand2",
+            activebackground=C["primary"], activeforeground=C["bg"],
+            padx=10, pady=4)
+        self._readonly_btn.pack(side="left", padx=(0, 8))
 
         self._auto_btn = tk.Button(
             right, text="▶  AUTO", command=self._toggle_autoscroll,
@@ -389,6 +531,13 @@ class OverlayApp:
             insertwidth=0)
         self.text.grid(row=1, column=0, sticky="nsew")
         self.text.bind("<Button-1>", self._on_text_click)
+        self.text.bind("<B1-Motion>", self._on_text_motion)
+
+        # Content area drag handlers for read mode
+        for w in (vp, ac_outer, accent, inner, self._manuscript_lbl, self._body, self._main_col):
+            w.bind("<ButtonPress-1>", self._on_content_drag_start)
+            w.bind("<B1-Motion>",     self._on_content_drag_motion)
+
         self._configure_tags()
 
         # ── NEXT CARD ──
@@ -472,6 +621,9 @@ class OverlayApp:
             background="#1e2a40", underline=True)
         t.tag_configure("autoscroll_hl",
             background=C["primary"], foreground=C["bg"])
+        t.tag_configure("copilot_think",        # the model's live reasoning preview
+            font=(SERIF, fs - 1, "italic"), foreground=C["muted"],
+            lmargin1=12, lmargin2=12, rmargin=12, spacing1=1)
 
     # ── SLIDE RENDERING ──────────────────────────────────────────────────────
 
@@ -493,6 +645,8 @@ class OverlayApp:
                 if s.startswith(prefix):
                     s = s[len(prefix):]
                     break
+            # Collapse ![alt](...) images to a marker so base64 never bloats previews
+            s = re.sub(r'!\[[^\]]*\]\([^)]*\)', '🖼 image', s)
             # Strip **bold**
             s = re.sub(r'\*\*(.+?)\*\*', r'\1', s)
             # Strip ==highlight==
@@ -517,6 +671,7 @@ class OverlayApp:
         self.text.insert("end", "\n")
 
     def _render_active_content(self, slide):
+        self._imgs   = []          # release refs from the previous slide (let tk GC them)
         in_prompt    = False
         blank_pend   = False
         for raw in slide.split('\n'):
@@ -527,6 +682,17 @@ class OverlayApp:
             if blank_pend:
                 self.text.insert("end", "\n")
                 blank_pend = False
+            # A line that is only an image:  ![alt](data:...  |  img:N  |  local path)
+            m_img = re.match(r'^!\[[^\]]*\]\((.+)\)\s*$', line)
+            if m_img:
+                in_prompt = False
+                target = m_img.group(1).strip()
+                if target.startswith("img:"):
+                    target = self._img_store.get(target[4:], target)
+                elif target.startswith("data:"):
+                    self._collapse_images(line)  # cache in store
+                self._insert_image(target)
+                continue
             if line.startswith('> '):
                 if not in_prompt:
                     self.text.insert("end", "❝  SPEAKER PROMPT\n", "prompt_header")
@@ -539,14 +705,144 @@ class OverlayApp:
                 elif line.startswith(('- ', '* ')): self._insert_rich('  •  ' + line[2:], "bullet")
                 else:                                self._insert_rich(line,      "body")
 
+    # ── IMAGES IN NOTES ──────────────────────────────────────────────────────
+
+    def _collapse_images(self, text):
+        """Replace ![alt](data:image/...) with ![alt](img:N) so raw base64 never
+        bloats or corrupts the editor while editing."""
+        if not text:
+            return ""
+
+        def _repl(m):
+            alt = m.group(1) or "photo"
+            url = m.group(2).strip()
+            clean_url = re.sub(r'\s+', '', url)
+            matched_id = None
+            for k, v in self._img_store.items():
+                if v == clean_url or v == url:
+                    matched_id = k
+                    break
+            if not matched_id:
+                matched_id = str(len(self._img_store) + 1)
+                self._img_store[matched_id] = clean_url
+            label = alt if alt and alt != "image" else f"photo {matched_id}"
+            return f"![{label}](img:{matched_id})"
+
+        return re.sub(r'!\[([^\]]*)\]\((data:image\/[^)]+)\)', _repl, text)
+
+    def _expand_images(self, text):
+        """Expand ![alt](img:N) back into ![alt](data:image/...) using _img_store."""
+        if not text:
+            return ""
+
+        def _repl(m):
+            alt = m.group(1) or "photo"
+            token_id = m.group(2)
+            if token_id in self._img_store:
+                return f"![{alt}]({self._img_store[token_id]})"
+            return m.group(0)
+
+        return re.sub(r'!\[([^\]]*)\]\(img:(\d+)\)', _repl, text)
+
+    def _load_image(self, src):
+        """Turn an image markdown target into a tk image object, scaled to fit the
+        active card. Accepts data: URLs (from the phone editor) and local file
+        paths (desktop). Uses Pillow for smooth scaling / broad formats when it is
+        installed, else falls back to tk.PhotoImage (PNG/GIF) with integer
+        subsampling. Never touches the network. Returns None if it can't decode."""
+        import base64, io
+        # Available width inside the card; winfo_width is 1 before first layout.
+        try:
+            avail = self.text.winfo_width() - 44
+        except Exception:                    # noqa: BLE001
+            avail = 0
+        if avail < 120:
+            avail = 560
+        max_h = 380
+
+        if src.startswith("img:"):
+            token_id = src[4:]
+            src = self._img_store.get(token_id, src)
+
+        # Every remote keystroke re-renders the card; decoding + resizing each
+        # photo again made typing on the phone lag on the overlay. Reuse them.
+        key = (hash(src), len(src), avail, max_h)
+        cached = self._img_cache.get(key)
+        if cached is not None:
+            return cached
+        img = self._decode_image(src, avail, max_h)
+        if img is not None:
+            if len(self._img_cache) >= 48:
+                self._img_cache.pop(next(iter(self._img_cache)))   # drop oldest
+            self._img_cache[key] = img
+        return img
+
+    def _decode_image(self, src, avail, max_h):
+        import base64, io
+        data = None
+        if src.startswith("data:"):
+            try:
+                data = base64.b64decode(src.split(",", 1)[1])
+            except Exception:                # noqa: BLE001
+                return None
+        else:
+            # local file only — do not fetch http(s), keep the overlay offline
+            if os.path.exists(src):
+                try:
+                    with open(src, "rb") as f:
+                        data = f.read()
+                except Exception:            # noqa: BLE001
+                    return None
+            else:
+                return None
+
+        # Preferred path: Pillow (smooth resize, handles JPEG/WebP/etc.)
+        try:
+            from PIL import Image, ImageTk
+            im = Image.open(io.BytesIO(data)); im.load()
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            scale = min(1.0, avail / im.width, max_h / im.height)
+            if scale < 1.0:
+                im = im.resize((max(1, int(im.width * scale)),
+                                max(1, int(im.height * scale))), Image.LANCZOS)
+            return ImageTk.PhotoImage(im)
+        except Exception:                    # noqa: BLE001 — Pillow absent or format unsupported
+            pass
+
+        # Fallback: built-in tk image (PNG/GIF), integer downscale only
+        try:
+            b64 = base64.b64encode(data).decode("ascii")
+            img = tk.PhotoImage(data=b64)
+            factor = 1
+            while img.width() // factor > avail or img.height() // factor > max_h:
+                factor += 1
+            if factor > 1:
+                img = img.subsample(factor, factor)
+            return img
+        except Exception:                    # noqa: BLE001
+            return None
+
+    def _insert_image(self, src):
+        img = self._load_image(src)
+        if img is None:
+            self.text.insert("end", "🖼  [image unavailable]\n", "body")
+            return
+        self._imgs.append(img)               # hold a ref or tk garbage-collects it
+        self.text.insert("end", "\n")
+        self.text.image_create("end", image=img)
+        self.text.insert("end", "\n")
+
     def render_slide(self):
         # NOTE: do NOT stop auto-scroll / voice here. render_slide() runs on every
         # remote sync update too — killing the highlight on each Firebase poll is
         # what broke "click a word and keep scrolling". Following is stopped only
         # on real navigation (see navigate / navigate_to / load_file).
 
+        readonly = getattr(self, "_readonly", False)  # read-only = notes text only
+
         # ── PREV CARD ──
-        if self.current > 0:
+        if self.current > 0 and not readonly:
             prev_title   = self._extract_title(self.slides[self.current - 1]) or ""
             prev_preview = self._preview_text(self.slides[self.current - 1])
             self._prev_nav.config(
@@ -562,10 +858,10 @@ class OverlayApp:
         self.text.config(state="normal")
         self.text.delete("1.0", "end")
         self._render_active_content(self.slides[self.current])
-        self.text.config(state="disabled")
+        self.text.config(state="disabled", cursor="arrow")
 
         # ── NEXT CARD ──
-        if self.current < len(self.slides) - 1:
+        if self.current < len(self.slides) - 1 and not readonly:
             next_title   = self._extract_title(self.slides[self.current + 1]) or ""
             next_preview = self._preview_text(self.slides[self.current + 1])
             self._next_nav.config(
@@ -603,7 +899,7 @@ class OverlayApp:
         self.text.config(state="disabled")
 
     def navigate(self, delta):
-        if self._editing:
+        if self._editing or self._copilot_active:
             return
         new = self.current + delta
         if 0 <= new < len(self.slides):
@@ -619,23 +915,78 @@ class OverlayApp:
 
     # ── INLINE EDITING (two-way sync) ────────────────────────────────────────
 
+    def _toggle_readonly(self):
+        self._readonly = not self._readonly
+        if self._readonly:
+            if self._editing:
+                self._commit_edit()
+            if self._logs_visible:
+                self._hide_logs()
+            self._readonly_btn.config(
+                text="READ ONLY", bg="#dcc661", fg="#141314",
+                activebackground="#dcc661", activeforeground="#141314")
+            self.text.config(state="disabled")
+            # Notes text only: drop sidebar, button bar, header, prev/next cards;
+            # the top bar just shows an "R" badge.
+            self._sidebar.pack_forget()
+            self._statusbar.pack_forget()
+            self._manuscript_lbl.grid_remove()
+            self._prev_card.grid_remove()
+            self._next_card.grid_remove()
+            self._ro_badge.pack(side="left", padx=(8, 0))
+            print("[Mode] READ ONLY mode activated - drag anywhere to move")
+        else:
+            self._readonly_btn.config(
+                text="EDITABLE", bg="#252829", fg="#ffffff",
+                activebackground=C["primary"], activeforeground=C["bg"])
+            self._ro_badge.pack_forget()
+            self._sidebar.pack(side="left", fill="y", before=self._main_col)
+            self._statusbar.pack(fill="x", before=self._vp)
+            self._manuscript_lbl.grid()
+            self.text.config(state="normal", cursor="arrow")
+            self.render_slide()
+            if hasattr(self, "_breadcrumb") and self._breadcrumb.winfo_exists():
+                self._breadcrumb.config(text="EDITABLE: CLICK TEXT TO EDIT", fg=C["primary"])
+                self.root.after(2000, self._update_statusbar)
+            print("[Mode] EDITABLE mode activated - click text to edit notes")
+
+    def _on_content_drag_start(self, event):
+        if getattr(self, "_readonly", False):
+            self._start_drag(event)
+            return "break"
+
+    def _on_content_drag_motion(self, event):
+        if getattr(self, "_readonly", False):
+            self._do_drag(event)
+            return "break"
+
     def _on_text_click(self, event):
         """Single click on the active card.
 
         While following along (voice / auto-scroll) a click re-seeks the
         highlight to that word. Otherwise it drops straight into edit mode
-        with the caret placed where you clicked.
+        with the caret placed where you clicked (unless in read-only mode).
         """
         if self._editing:
             return              # already editing — let default caret placement run
+        if getattr(self, "_readonly", False):
+            self._start_drag(event)
+            return "break"      # READ ONLY: drag window instead of entering edit mode!
+        if self._copilot_active:
+            return "break"      # copilot owns the card; no edit/seek
         if self._voice_active or self._autoscroll_active:
             return self._seek_word(event)
         self._enter_edit_mode(event)
         return "break"          # we place the caret ourselves
 
+    def _on_text_motion(self, event):
+        if getattr(self, "_readonly", False):
+            self._do_drag(event)
+            return "break"
+
     def _enter_edit_mode(self, event=None):
-        """Edit the raw markdown of the current slide, caret at the click point."""
-        if self._editing:
+        """Edit the raw markdown of the current slide, with collapsed image tokens."""
+        if self._editing or getattr(self, "_readonly", False):
             return
         if self._autoscroll_active:
             self._toggle_autoscroll()
@@ -648,7 +999,10 @@ class OverlayApp:
         for tag in ("h1", "h2", "body", "bold", "bullet",
                     "prompt_header", "prompt_body", "keyword", "autoscroll_hl"):
             self.text.tag_remove(tag, "1.0", "end")
-        self.text.insert("1.0", self.slides[self.current])
+
+        editable = self._collapse_images(self.slides[self.current])
+        self.text.insert("1.0", editable)
+
         self._manuscript_lbl.config(
             text=f"✏  EDITING  ·  SLIDE {self.current + 1}  ·  Esc or click away to save")
         self.text.focus_set()
@@ -663,6 +1017,54 @@ class OverlayApp:
         self.text.bind("<FocusOut>", self._commit_edit)
         self.text.bind("<Escape>",   self._commit_edit)
         self.text.bind("<KeyRelease>", self._on_edit_key)
+        self.text.bind("<Control-v>", self._on_edit_paste)
+        self.text.bind("<Control-V>", self._on_edit_paste)
+
+    def _on_edit_paste(self, event=None):
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grabclipboard()
+            if img is not None:
+                if isinstance(img, list):
+                    if img and isinstance(img[0], str) and img[0].lower().endswith(
+                            ('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+                        from PIL import Image
+                        img = Image.open(img[0])
+                    else:
+                        img = None
+                if img is not None and hasattr(img, 'convert'):
+                    import io, base64
+                    im = img.convert('RGB')
+                    max_dim = 1200
+                    w, h = im.size
+                    if w > max_dim or h > max_dim:
+                        ratio = min(max_dim / w, max_dim / h)
+                        new_w = max(1, int(w * ratio))
+                        new_h = max(1, int(h * ratio))
+                        im = im.resize((new_w, new_h), Image.Resampling.LANCZOS)
+                    bio = io.BytesIO()
+                    im.save(bio, format='JPEG', quality=85)
+                    b64 = base64.b64encode(bio.getvalue()).decode('ascii')
+                    data_url = f"data:image/jpeg;base64,{b64}"
+                    img_id = str(len(self._img_store) + 1)
+                    self._img_store[img_id] = data_url
+                    md = f"\n![photo {img_id}](img:{img_id})\n"
+                    self.text.insert("insert", md)
+                    return "break"
+        except Exception as e:
+            print(f"[Paste] image paste error: {e}")
+
+        # Check if clipboard has markdown text containing data URLs
+        try:
+            clip = self.root.clipboard_get()
+            if clip and "](data:image/" in clip:
+                collapsed = self._collapse_images(clip)
+                self.text.insert("insert", collapsed)
+                return "break"
+        except Exception:
+            pass
+
+        return None
 
     def _commit_edit(self, event=None):
         if not self._editing:
@@ -672,9 +1074,12 @@ class OverlayApp:
             self.root.after_cancel(self._live_after)
             self._live_after = None
         new_content = self.text.get("1.0", "end-1c")
+        new_content = self._expand_images(new_content)
         self.text.unbind("<FocusOut>")
         self.text.unbind("<Escape>")
         self.text.unbind("<KeyRelease>")
+        self.text.unbind("<Control-v>")
+        self.text.unbind("<Control-V>")
         self.text.config(cursor="arrow", insertwidth=0)
         # An edit may introduce `---` separators — re-split the edited slide.
         pieces = [s.strip() for s in re.split(r'\n\s*---\s*\n', new_content)
@@ -695,8 +1100,7 @@ class OverlayApp:
         self._last_synced = content        # echo guard for inbound listeners
         self._edit_guard_until = time.time() + 1.5   # ride out the PUT round-trip
         if self._sync_mode == "firebase":
-            threading.Thread(target=self._firebase_put,
-                             args=(content,), daemon=True).start()
+            self._queue_firebase_put(content)
         elif self._sync_mode == "local":
             if self._ws_loop and self._ws_clients:
                 self._ws_loop.call_soon_threadsafe(self._ws_broadcast, content)
@@ -713,6 +1117,7 @@ class OverlayApp:
         if not self._editing:
             return
         buffer = self.text.get("1.0", "end-1c")
+        buffer = self._expand_images(buffer)
         parts  = list(self.slides)
         if 0 <= self.current < len(parts):
             parts[self.current] = buffer
@@ -720,11 +1125,30 @@ class OverlayApp:
             parts = [buffer]
         self._broadcast_content("\n---\n".join(parts))
 
+    def _queue_firebase_put(self, content):
+        """Hand content to one writer thread that always PUTs the newest value.
+        A thread per PUT let a slow older write land after a newer one; this
+        also coalesces bursts of keystrokes into a single write."""
+        with self._fb_put_lock:
+            self._fb_put_pending = content
+            if self._fb_put_busy:
+                return
+            self._fb_put_busy = True
+        threading.Thread(target=self._firebase_writer, name="fb-writer", daemon=True).start()
+
+    def _firebase_writer(self):
+        while True:
+            with self._fb_put_lock:
+                content, self._fb_put_pending = self._fb_put_pending, None
+                if content is None:
+                    self._fb_put_busy = False
+                    return
+            self._firebase_put(content)
+
     def _firebase_put(self, content):
         try:
-            import requests
-            requests.put(f"{self._firebase_url}/overlay/content.json",
-                         data=json.dumps(content), timeout=5)
+            self._fb_session().put(f"{self._firebase_url}/overlay/content.json",
+                                   data=json.dumps(content), timeout=5)
         except Exception as e:
             print(f"[Firebase] push failed: {type(e).__name__}: {e}")
 
@@ -748,12 +1172,17 @@ class OverlayApp:
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")])
         if not path or not os.path.exists(path):
             return
-        with open(path, encoding="utf-8") as f:
+        # utf-8-sig strips a BOM so a Notepad-saved file's first heading isn't
+        # prefixed with a stray ﻿ character.
+        with open(path, encoding="utf-8-sig") as f:
             content = f.read().replace('\r\n', '\n').replace('\r', '\n')
         parsed       = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                         if s.strip()]
         self.slides  = parsed if parsed else ["# Empty file\n\nNo slides found."]
         self.current = 0
+        # Loading a deck while copilot owns the card: stash it but stay in copilot.
+        if self._copilot_active:
+            return
         self._stop_following()
         self.render_slide()
         self.root.focus_force()
@@ -822,62 +1251,329 @@ class OverlayApp:
     # ── REMOTE SYNC ──────────────────────────────────────────────────────────
 
     def _apply_remote_content(self, content):
+        self._remote_latest = content
         if self._editing or time.time() < self._edit_guard_until:
-            return              # don't clobber an in-progress / just-finished local edit
+            # don't clobber an in-progress / just-finished local edit; a push stream
+            # delivers each change once, so re-check until the edit is done
+            self.root.after(400, lambda: self._remote_latest == content
+                            and content != self._last_synced
+                            and self._apply_remote_content(content))
+            return
         self._last_synced = content   # mark seen only now that we're actually applying
         content = content.replace('\r\n', '\n').replace('\r', '\n')
         parsed  = [s.strip() for s in re.split(r'\n\s*---\s*\n', content)
                    if s.strip()]
         if not parsed:
-            return
+            parsed = [""]   # all text deleted on the phone → blank the card, don't keep stale text
         self.slides  = parsed
         self.current = min(self.current, len(parsed) - 1)
+        # Copilot owns the card while active — stash the updated deck but don't
+        # repaint over the streaming answer. The teleprompter is repainted by the
+        # render_slide() inside _stop_copilot when the user leaves copilot mode.
+        if self._copilot_active:
+            return
         self.render_slide()
+
+    # ── REMOTE COMMANDS (phone UI controls) ─────────────────────────────────
+
+    def _handle_remote_cmd(self, data):
+        if not isinstance(data, dict):
+            return
+        ts = data.get("ts", 0)
+        if not isinstance(ts, (int, float)):
+            return
+        if ts and ts <= self._last_cmd_ts:
+            return
+        self._last_cmd_ts = ts
+
+        cmd = data.get("cmd")
+        print(f"[RemoteCmd] {cmd} | {data}")
+        if cmd == "navigate":
+            delta = data.get("delta", 0)
+            if isinstance(delta, int) and delta:
+                self.navigate(delta)
+        elif cmd == "navigate_to":
+            idx = data.get("index", 0)
+            if isinstance(idx, int):
+                self.navigate_to(idx)
+        elif cmd == "scroll":
+            delta = data.get("delta", 0)
+            if isinstance(delta, (int, float)) and delta:
+                self._scroll_text(int(delta))
+        elif cmd == "scroll_to":
+            frac = data.get("fraction")
+            if isinstance(frac, (int, float)):
+                self.text.yview_moveto(max(0.0, min(1.0, float(frac))))
+        elif cmd == "opacity":
+            val = data.get("value")
+            if isinstance(val, (int, float)):
+                self._on_opacity(str(max(0, min(100, int(val)))))
+        elif cmd == "font":
+            delta = data.get("delta", 0)
+            if isinstance(delta, int) and delta:
+                self._change_font(delta)
+        elif cmd == "screenshot":
+            req_id = data.get("req_id", "")
+            threading.Thread(target=self._capture_and_send_screenshot,
+                             args=(req_id,), daemon=True).start()
+
+    def _scroll_text(self, delta):
+        units = max(1, min(50, abs(delta)))
+        if delta > 0:
+            self.text.yview_scroll(units, "units")
+        elif delta < 0:
+            self.text.yview_scroll(-units, "units")
+
+    def _take_screenshot_data_url(self):
+        import base64, io
+        from PIL import Image
+
+        im = None
+        # Primary method: PIL ImageGrab (DPI-aware, multi-monitor support on Windows)
+        try:
+            from PIL import ImageGrab
+            im = ImageGrab.grab(all_screens=True)
+        except Exception as e:
+            print(f"[Screenshot] ImageGrab failed ({e}), trying Win32 GDI...")
+
+        # Fallback method: Win32 GDI BitBlt
+        if im is None:
+            import ctypes, ctypes.wintypes
+            user32 = ctypes.windll.user32
+            gdi32 = ctypes.windll.gdi32
+
+            vx = user32.GetSystemMetrics(76)  # SM_XVIRTUALSCREEN
+            vy = user32.GetSystemMetrics(77)  # SM_YVIRTUALSCREEN
+            vw = user32.GetSystemMetrics(78)  # SM_CXVIRTUALSCREEN
+            vh = user32.GetSystemMetrics(79)  # SM_CYVIRTUALSCREEN
+            if vw <= 0 or vh <= 0:
+                vw = user32.GetSystemMetrics(0)  # SM_CXSCREEN
+                vh = user32.GetSystemMetrics(1)  # SM_CYSCREEN
+                vx, vy = 0, 0
+
+            hdc = user32.GetDC(0)
+            memdc = gdi32.CreateCompatibleDC(hdc)
+            hbmp = gdi32.CreateCompatibleBitmap(hdc, vw, vh)
+            old_bmp = gdi32.SelectObject(memdc, hbmp)
+
+            try:
+                gdi32.BitBlt(memdc, 0, 0, vw, vh, hdc, vx, vy, 0x00CC0020 | 0x40000000)
+
+                class BITMAPINFOHEADER(ctypes.Structure):
+                    _fields_ = [
+                        ('biSize', ctypes.wintypes.DWORD), ('biWidth', ctypes.wintypes.LONG),
+                        ('biHeight', ctypes.wintypes.LONG), ('biPlanes', ctypes.wintypes.WORD),
+                        ('biBitCount', ctypes.wintypes.WORD), ('biCompression', ctypes.wintypes.DWORD),
+                        ('biSizeImage', ctypes.wintypes.DWORD), ('biXPelsPerMeter', ctypes.wintypes.LONG),
+                        ('biYPelsPerMeter', ctypes.wintypes.LONG), ('biClrUsed', ctypes.wintypes.DWORD),
+                        ('biClrImportant', ctypes.wintypes.DWORD)
+                    ]
+
+                bmi = BITMAPINFOHEADER()
+                bmi.biSize = ctypes.sizeof(BITMAPINFOHEADER)
+                bmi.biWidth = vw
+                bmi.biHeight = -vh  # top-down DIB
+                bmi.biPlanes = 1
+                bmi.biBitCount = 32
+                bmi.biCompression = 0
+
+                buf = ctypes.create_string_buffer(vw * vh * 4)
+                gdi32.GetDIBits(memdc, hbmp, 0, vh, buf, ctypes.byref(bmi), 0)
+                im = Image.frombuffer('RGBA', (vw, vh), buf, 'raw', 'BGRA', 0, 1).convert('RGB')
+            finally:
+                gdi32.SelectObject(memdc, old_bmp)
+                gdi32.DeleteObject(hbmp)
+                gdi32.DeleteDC(memdc)
+                user32.ReleaseDC(0, hdc)
+
+        if im.mode != 'RGB':
+            im = im.convert('RGB')
+
+        # Limit maximum dimension to 1920 to keep upload small (~50-150KB) for instant sync
+        max_dim = 1920
+        w, h = im.size
+        if w > max_dim or h > max_dim:
+            ratio = min(max_dim / w, max_dim / h)
+            new_w = max(1, int(w * ratio))
+            new_h = max(1, int(h * ratio))
+            # reducing_gap: shrink by a cheap integer factor first, then filter —
+            # several times faster than a full LANCZOS pass, same look on screen text
+            im = im.resize((new_w, new_h), Image.Resampling.LANCZOS, reducing_gap=2.0)
+
+        bio = io.BytesIO()
+        # optimize=True re-encodes for a few % smaller files at ~2x the encode time
+        im.save(bio, format='JPEG', quality=85)
+        b64 = base64.b64encode(bio.getvalue()).decode('ascii')
+        return f"data:image/jpeg;base64,{b64}", im
+
+    def _copy_image_to_system_clipboard(self, im):
+        try:
+            import ctypes, io
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+
+            bio = io.BytesIO()
+            im.convert('RGB').save(bio, 'BMP')
+            data = bio.getvalue()[14:]  # BMP header is 14 bytes; rest is DIB
+            size = len(data)
+            hmem = kernel32.GlobalAlloc(0x0002, size)  # GMEM_MOVEABLE
+            if not hmem:
+                return False
+            ptr = kernel32.GlobalLock(hmem)
+            if not ptr:
+                kernel32.GlobalFree(hmem)
+                return False
+            ctypes.memmove(ptr, data, size)
+            kernel32.GlobalUnlock(hmem)
+            if not user32.OpenClipboard(0):
+                kernel32.GlobalFree(hmem)
+                return False
+            user32.EmptyClipboard()
+            user32.SetClipboardData(8, hmem)  # CF_DIB = 8
+            user32.CloseClipboard()
+            return True
+        except Exception as e:
+            print(f"[Screenshot] Local clipboard copy skipped: {e}")
+            return False
+
+    def _capture_and_send_screenshot(self, req_id=""):
+        try:
+            if not req_id:
+                req_id = f"shot_{int(time.time()*1000)}"
+            print(f"[Screenshot] Capturing screen for req {req_id}...")
+            data_url, im = self._take_screenshot_data_url()
+            payload = {
+                "req_id": req_id,
+                "ts": time.time(),
+                "image": data_url
+            }
+            if (self._sync_mode == "firebase" or not self._sync_mode) and self._firebase_url:
+                r = self._fb_session().put(f"{self._firebase_url}/overlay/screenshot.json",
+                                           data=json.dumps(payload), timeout=10)
+                print(f"[Screenshot] Pushed screenshot to Firebase (HTTP {r.status_code})")
+            if self._sync_mode == "local" or (self._ws_loop and self._ws_clients):
+                msg = json.dumps({"type": "screenshot", **payload})
+                self._ws_loop.call_soon_threadsafe(self._ws_broadcast, msg)
+                print(f"[Screenshot] Broadcasted screenshot to WS clients")
+            # local clipboard copy last — the phone is waiting on the upload above
+            if im is not None:
+                self._copy_image_to_system_clipboard(im)
+        except Exception as e:
+            print(f"[Screenshot] Error: {type(e).__name__}: {e}")
 
     def start_firebase_sync(self, db_url):
         self._firebase_url  = db_url.rstrip("/")
         self._sync_version += 1
         self._sync_mode = "firebase"
+        self._last_cmd_ts = time.time() * 1000
         v = self._sync_version
         self.root.after(0, self._show_live_badge)
-        threading.Thread(target=self._firebase_loop,
-                         args=(self._firebase_url, v), daemon=True).start()
+        # Firebase REST streaming (Server-Sent Events): Firebase pushes each change
+        # the moment it lands, over one long-lived connection per node. Replaces
+        # polling /overlay.json, which re-downloaded every photo and the last
+        # screenshot (~250 KB) over a fresh TLS connection several times a second.
+        # Each node is streamed on its own so a big screenshot never rides along.
+        for node, handler in (("content",  self._on_fb_content),
+                              ("command",  self._on_fb_command),
+                              ("presence", self._on_fb_presence)):
+            threading.Thread(target=self._firebase_stream,
+                             args=(self._firebase_url, node, handler, v),
+                             name=f"fb-{node}", daemon=True).start()
 
-    def _firebase_loop(self, db_url, version):
+    def _fb_session(self):
+        """Shared keep-alive HTTP session for Firebase writes. Reusing the TLS
+        connection makes a PUT ~75 ms instead of ~0.5-1 s for a fresh one."""
+        if self._http is None:
+            import requests
+            self._http = requests.Session()
+        return self._http
+
+    def _firebase_stream(self, db_url, node, handler, version):
         try:
             import requests
         except ImportError:
             return
-        # Poll the parent node so one request returns both the notes content and
-        # the phone's presence heartbeat (written by the web UI while it's open).
-        url  = f"{db_url}/overlay.json"
+        url, backoff = f"{db_url}/overlay/{node}.json", 1.0
         while self._sync_version == version:
             try:
-                r = requests.get(url, timeout=5)
-                if r.ok:
-                    self._fb_last_ok = time.time()
-                    data = r.json()
-                    if isinstance(data, dict):
-                        content  = data.get("content")
-                        presence = data.get("presence")
-                    elif isinstance(data, str):       # backward-compat (flat content)
-                        content, presence = data, None
-                    else:
-                        content, presence = None, None
-                    # "peer present" = heartbeat keeps changing; track when it last did
-                    if presence is not None and presence != self._fb_presence_val:
-                        self._fb_presence_val = presence
-                        self._fb_presence_at  = time.time()
-                    # NOTE: don't mark content as seen here — _apply_remote_content does
-                    # that only when it actually applies, so an update that arrives
-                    # mid-edit is retried (not silently dropped) once editing ends.
-                    if isinstance(content, str) and content != self._last_synced:
-                        self.root.after(0, lambda c=content: self._apply_remote_content(c))
-            except Exception as e:
-                print(f"[Firebase] {type(e).__name__}: {e}")
-                time.sleep(2)
-                continue
-            time.sleep(0.4)    # ~2.5 req/s — snappier pickup, still well under rate limits
+                # read timeout > Firebase's 30 s keep-alive, so a silent drop is noticed
+                with requests.get(url, headers={"Accept": "text/event-stream"},
+                                  stream=True, timeout=(10, 75)) as r:
+                    if not r.ok:
+                        raise RuntimeError(f"HTTP {r.status_code}")
+                    self._fb_streams.add(node)
+                    backoff = 1.0
+                    value, event = None, None
+                    # raw.readline(): Firebase streams without chunked encoding, and
+                    # iter_lines() then buffers until the connection closes.
+                    while True:
+                        raw = r.raw.readline()
+                        if not raw:
+                            raise RuntimeError("stream closed")
+                        if self._sync_version != version:
+                            return
+                        self._fb_last_ok = time.time()
+                        line = raw.decode("utf-8", "replace").rstrip("\r\n")
+                        if line.startswith("event:"):
+                            event = line[6:].strip()
+                        elif line.startswith("data:") and event in ("put", "patch"):
+                            msg = json.loads(line[5:].strip())
+                            value = self._fb_apply_event(value, event, msg.get("path", "/"),
+                                                         msg.get("data"))
+                            handler(value)
+                        elif event in ("cancel", "auth_revoked"):
+                            raise RuntimeError(f"stream {event}")
+            except Exception as e:                   # noqa: BLE001 — reconnect on anything
+                if self._sync_version != version:
+                    return
+                print(f"[Firebase] {node} stream: {type(e).__name__}: {e} — reconnecting")
+            finally:
+                self._fb_streams.discard(node)
+            time.sleep(backoff)
+            backoff = min(backoff * 2, 8.0)
+
+    @staticmethod
+    def _fb_apply_event(value, event, path, data):
+        """Fold one SSE put/patch into the locally mirrored node value."""
+        keys = [k for k in path.split("/") if k]
+        if not keys:
+            if event == "put" or not isinstance(value, dict):
+                return data
+            return {**value, **(data or {})}
+        root = value if isinstance(value, dict) else {}
+        node = root
+        for k in keys[:-1]:
+            if not isinstance(node.get(k), dict):
+                node[k] = {}
+            node = node[k]
+        if event == "patch" and isinstance(node.get(keys[-1]), dict) and isinstance(data, dict):
+            node[keys[-1]].update(data)
+        elif data is None:
+            node.pop(keys[-1], None)
+        else:
+            node[keys[-1]] = data
+        return root
+
+    def _on_fb_content(self, content):
+        # NOTE: don't mark content as seen here — _apply_remote_content does that
+        # only when it actually applies (and retries while a local edit is open).
+        if isinstance(content, str) and content != self._last_synced:
+            self.root.after(0, lambda c=content: self._apply_remote_content(c))
+
+    def _on_fb_command(self, command):
+        if isinstance(command, dict) and "cmd" in command:
+            self.root.after(0, lambda d=dict(command): self._handle_remote_cmd(d))
+
+    def _on_fb_presence(self, presence):
+        # "peer present" = heartbeat keeps changing; track when it last did
+        if presence is not None and presence != self._fb_presence_val:
+            self._fb_presence_val = presence
+            self._fb_presence_at  = time.time()
 
     def start_local_ws_server(self, port=8765):
         self._sync_version += 1
@@ -909,6 +1605,13 @@ class OverlayApp:
                         if len(msg) > MAX_MSG:
                             print(f"[WebSocket] message dropped: {len(msg):,} bytes exceeds limit")
                             continue
+                        try:
+                            data = json.loads(msg)
+                            if isinstance(data, dict) and "cmd" in data:
+                                self.root.after(0, lambda d=data: self._handle_remote_cmd(d))
+                                continue
+                        except (json.JSONDecodeError, ValueError):
+                            pass
                         self.root.after(0, lambda c=msg: self._apply_remote_content(c))
             finally:
                 self._ws_clients.discard(ws)
@@ -937,8 +1640,8 @@ class OverlayApp:
     def _sync_health(self):
         """Return (live, label, color). `live` (a peer is actively present) → pulse."""
         if self._sync_mode == "firebase":
-            if time.time() - self._fb_last_ok >= 3:
-                return False, "RECONNECTING…", C["yellow"]          # can't reach Firebase
+            if "content" not in self._fb_streams:
+                return False, "RECONNECTING…", C["yellow"]          # stream not connected
             if time.time() - self._fb_presence_at < 8:
                 return True, "LIVE SYNCING", C["primary"]            # phone is on the line
             return False, "CONNECTED", C["on_sv"]                    # FB ok, no phone yet
@@ -999,6 +1702,8 @@ class OverlayApp:
             self._autoscroll_after = self.root.after(interval, self._autoscroll_step)
 
     def _toggle_autoscroll(self):
+        if self._copilot_active:
+            return                           # copilot owns the card — mutually exclusive
         self._autoscroll_active = not self._autoscroll_active
         if self._autoscroll_active:
             if self._voice_active:
@@ -1055,6 +1760,8 @@ class OverlayApp:
     # ── VOICE SYNC (Vosk) ────────────────────────────────────────────────────
 
     def _toggle_voice(self):
+        if self._copilot_active:
+            return                           # copilot owns the card — mutually exclusive
         if self._voice_active:
             self._stop_voice()
         else:
@@ -1083,7 +1790,7 @@ class OverlayApp:
         print(f"[Voice] {msg}")
 
     def _find_vosk_model(self):
-        base = os.path.dirname(os.path.abspath(__file__))
+        base = _app_dir()
         candidates = []
         env = os.environ.get("VOSK_MODEL")
         if env:
@@ -1217,6 +1924,472 @@ class OverlayApp:
                 break
         return "break"
 
+    # ── AI COPILOT (local, on-device) ────────────────────────────────────────
+    #
+    # A separate `copilot/` engine runs WASAPI loopback → faster-whisper → Qwen3
+    # (Ollama) and streams the answer back here. All engine callbacks fire on
+    # worker threads, so every one is marshalled onto the tk loop via root.after.
+
+    def _toggle_copilot(self):
+        if self._copilot_active:
+            self._stop_copilot()
+        else:
+            self._start_copilot()
+
+    def _start_copilot(self):
+        try:
+            from copilot import CopilotEngine
+        except Exception as e:                       # noqa: BLE001
+            print(f"[Copilot] engine import failed: {type(e).__name__}: {e}")
+            self._manuscript_lbl.config(
+                text="✦  COPILOT  ·  install deps: pip install -r requirements.txt")
+            return
+
+        # Copilot takes over the card — stop any teleprompter following / editing.
+        self._stop_following()
+        if self._editing:
+            self._commit_edit()
+        if self._logs_visible:
+            self._hide_logs()
+
+        self._copilot_active     = True
+        self._copilot_status     = "idle"
+        self._copilot_transcript = []
+        self._copilot_question   = ""
+        self._copilot_answer     = ""
+        self._copilot_answer_epoch = 0      # drop stray tokens from an aborted stream
+        self._copilot_editing    = False    # editing the pending-question panel?
+
+        def after(fn):
+            return lambda *a, **k: self.root.after(0, lambda: fn(*a, **k))
+
+        self._copilot_last_heard = ""
+        self._copilot_audio_at   = 0.0
+        self._copilot_lines      = []
+        self._copilot_partial    = ""
+        self._copilot = CopilotEngine(
+            on_status       =after(self._copilot_set_status),
+            on_transcript   =after(self._copilot_on_transcript),
+            on_utterance    =after(self._copilot_on_utterance),
+            on_partial      =after(self._copilot_on_partial),
+            on_answer_start =after(self._copilot_on_answer_start),
+            on_thinking     =after(self._copilot_on_thinking),
+            on_answer_token =after(self._copilot_on_answer_token),
+            on_answer_done  =after(self._copilot_on_answer_done),
+            on_error        =after(self._copilot_on_error),
+            on_audio        =after(self._copilot_on_audio))
+        self._copilot.start()
+        self._register_copilot_hotkey()
+        self._copilot_show_pane(True)
+        self._copilot_clear_transcript()
+        self._copilot_render()
+        # _hide_logs() above may have reset the active tab to NOTES — reclaim the
+        # COPILOT highlight (this won't re-tear-down: teardown is name != copilot).
+        self._set_active_tab("copilot")
+
+    def _stop_copilot(self, set_notes_tab=True):
+        if not self._copilot_active:
+            return
+        if self._copilot_editing:
+            self._copilot_exit_edit()        # restore the pane to a clean state
+        self._copilot_active = False
+        self._unregister_copilot_hotkey()
+        if self._copilot is not None:
+            self._copilot.stop()
+            self._copilot = None
+        self._copilot_show_pane(False)   # hide the live-transcript pane
+        if set_notes_tab:
+            self._set_active_tab("notes")
+        self.render_slide()        # always restore the teleprompter card (row 0)
+
+    # ── engine callbacks (already marshalled to the tk loop) ──────────────────
+    def _copilot_set_status(self, status):
+        if not self._copilot_active:
+            return
+        self._copilot_status = status
+        self._copilot_update_header()
+        # Keep the transcript-pane placeholder honest (loading vs listening vs
+        # error) until the first real speech arrives.
+        if not self._copilot_lines and not self._copilot_partial:
+            self._copilot_render_transcript()
+
+    def _copilot_on_transcript(self, buffer):
+        # Full rolling buffer (used by the engine for LLM context). The visible
+        # live transcript is appended incrementally in _copilot_on_utterance, and
+        # the answer streams into self.text on F9 — so nothing to repaint here.
+        if not self._copilot_active:
+            return
+        self._copilot_transcript = list(buffer)
+
+    def _copilot_on_answer_start(self, question, epoch=0):
+        if not self._copilot_active:
+            return
+        # New run owns the card now — record its epoch so late tokens from a
+        # superseded (aborted/re-rolled) stream are dropped below.
+        self._copilot_answer_epoch = epoch
+        self._copilot_question    = question
+        self._copilot_answer      = ""
+        self._copilot_think_open  = False
+        self._copilot_answer_open = False
+        # Hold the widget "normal" for the whole stream (re-disabled in _done) so
+        # tokens don't flip state on every chunk. The card has no caret
+        # (insertwidth=0) and clicks are swallowed by _on_text_click during
+        # copilot, so leaving it normal can't be edited by the user.
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", question.strip() + "\n", "h2")
+        self.text.insert("end", "\n")
+        self.text.see("1.0")        # show the top of the new answer; do NOT follow
+        self._copilot_update_header()
+
+    def _copilot_on_thinking(self, token, epoch=0):
+        """Live reasoning preview — stream it (dim/italic) so you can start framing
+        a reply before the polished answer is ready."""
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        if not self._copilot_think_open:
+            self.text.insert("end", "💭  THINKING…\n", "prompt_header")
+            self._copilot_think_open = True
+        self.text.insert("end", token, "copilot_think")
+        # No auto-scroll — the user controls the viewport while it streams.
+
+    def _copilot_on_answer_token(self, token, epoch=0):
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        # First answer token: if reasoning was shown above, label the answer so the
+        # two are visually separated; otherwise stream the answer straight in.
+        if not self._copilot_answer_open:
+            if self._copilot_think_open:
+                self.text.insert("end", "\n\n✦  ANSWER\n", "prompt_header")
+            self._copilot_answer_open = True
+        self._copilot_answer += token
+        self.text.insert("end", token, "body")
+        # No auto-scroll while generating — let the user scroll at their own pace.
+
+    def _copilot_on_answer_done(self, epoch=0):
+        if not self._copilot_active or epoch != self._copilot_answer_epoch:
+            return
+        self.text.config(state="disabled")     # re-lock after the streamed answer
+        self._copilot_update_header()
+
+    def _copilot_on_error(self, msg):
+        print(f"[Copilot] {msg}")
+        if self._copilot_active:
+            self._copilot_status = f"error — {msg}"
+            self._copilot_update_header()
+            if not self._copilot_lines and not self._copilot_partial:
+                self._copilot_render_transcript()
+
+    # ── trigger + rendering ───────────────────────────────────────────────────
+    def _copilot_trigger(self):
+        if not self._copilot_active or not self._copilot:
+            return
+        # While editing the question, Enter / Ctrl+Enter mean "commit + send" — not
+        # "trigger on the raw pending speech". (Plain Enter is already intercepted by
+        # the edit-box binding; this also covers the global Ctrl+Enter hotkey.)
+        if self._copilot_editing:
+            self._copilot_commit_edit()
+            return
+        self._copilot.trigger()
+
+    def _copilot_reset(self):
+        """F10 — start a fresh conversation: wipe the LLM memory and clear the
+        on-screen transcript + answer."""
+        if not self._copilot_active or not self._copilot:
+            return
+        if self._copilot_editing:
+            self._copilot_exit_edit()        # drop any in-progress question edit
+        self._copilot.reset_conversation()
+        self._copilot_lines    = []
+        self._copilot_partial  = ""
+        self._copilot_question = ""
+        self._copilot_answer   = ""
+        self._copilot_render_transcript()        # transcript pane → placeholder
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", "💬  NEW CONVERSATION\n", "prompt_header")
+        self.text.insert("end", "Memory cleared. Press Enter to answer the next "
+                                "question.", "body")
+        self.text.config(state="disabled")
+
+    def _copilot_on_audio(self, rms, device_name):
+        """Throttled (~3 Hz) audio-activity heartbeat from the capture layer."""
+        if not self._copilot_active:
+            return
+        self._copilot_audio_rms = rms
+        self._copilot_audio_at  = time.monotonic()
+        if device_name:
+            self._copilot_device = device_name
+        # Refresh the header only while idle/listening — never interrupt a stream.
+        if self._copilot_status in ("listening", "idle"):
+            self._copilot_update_header()
+
+    def _copilot_update_header(self):
+        # If the global hook failed (e.g. no admin), Enter only fires while the
+        # overlay is focused — tell the user instead of silently to stdout.
+        f9 = "Enter" if self._copilot_hotkey else "Enter (focus overlay)"
+        st = self._copilot_status
+        if self._copilot_editing:
+            label = "✦  COPILOT  ·  ✎ EDITING QUESTION  ·  Enter sends · Esc cancels"
+        elif st == "generating":
+            label = "✦  COPILOT  ·  ✦ GENERATING…"
+        elif st.startswith("loading") or st == "idle":
+            label = "✦  COPILOT  ·  ⏳ LOADING MODEL…"
+        elif st.startswith("error"):
+            label = f"✦  COPILOT  ·  ⚠ {st[8:]}"
+        elif st == "listening":
+            fresh   = (time.monotonic() - self._copilot_audio_at) < 0.6
+            hearing = fresh and self._copilot_audio_rms > 80   # quiet-room floor
+            if hearing:
+                label = f"✦  COPILOT  ·  🔊 HEARING…  ·  {f9} to answer"
+            elif self._copilot_audio_at:
+                label = f"✦  COPILOT  ·  ● LISTENING (silence)  ·  {f9}"
+            else:
+                label = f"✦  COPILOT  ·  ● LISTENING (no audio yet)  ·  {f9}"
+        else:
+            label = f"✦  COPILOT  ·  {st}"
+        self._manuscript_lbl.config(text=label)
+
+    def _build_copilot_pane(self):
+        """Live-transcript pane shown above the answer card during copilot mode.
+        Reuses row 0 of the viewport grid (where the prev card normally sits)."""
+        if self._copilot_pane is not None:
+            return
+        pane = tk.Frame(self._vp, bg=C["card_dim"])
+        hdr = tk.Frame(pane, bg=C["card_dim"])
+        hdr.pack(fill="x", padx=12, pady=(8, 2))
+        tk.Label(hdr, text="◉  LIVE TRANSCRIPT", bg=C["card_dim"],
+                 fg=C["primary"], font=(LABEL, 7, "bold")).pack(side="left")
+        # Hint doubles as the live-words indicator while editing the question.
+        self._copilot_tr_hint = tk.Label(
+            hdr, text=self._COPILOT_TR_HINT, bg=C["card_dim"],
+            fg=C["muted"], font=(LABEL, 7))
+        self._copilot_tr_hint.pack(side="right")
+        txt = tk.Text(pane, height=6, bg=C["card_dim"], fg=C["on_sv"],
+                      relief="flat", bd=0, state="disabled", wrap="word",
+                      cursor="arrow", font=(SANS, max(8, self.font_size - 1)),
+                      padx=12, pady=(0), spacing3=3, insertwidth=0,
+                      highlightthickness=0)
+        txt.pack(fill="both", expand=True, padx=2, pady=(0, 8))
+        txt.tag_configure("tr_line", foreground=C["on_sv"])
+        txt.tag_configure("tr_new",  foreground=C["on_s"])
+        txt.tag_configure("tr_partial", foreground=C["primary"], font=(SANS,
+                          max(8, self.font_size - 1), "italic"))
+        # Click a word in the pending question to correct it before sending.
+        txt.bind("<Button-1>", self._copilot_tr_click)
+        self._copilot_pane    = pane
+        self._copilot_tr_text = txt
+
+    def _copilot_show_pane(self, show):
+        self._build_copilot_pane()
+        if show:
+            # Row 0 keeps weight 0 (its default) so the transcript stays a fixed
+            # ~6-line band and the answer card in row 1 (weight 1) takes the rest.
+            self._copilot_pane.grid(row=0, column=0, sticky="nsew", pady=(0, 4))
+        else:
+            self._copilot_pane.grid_remove()
+
+    def _copilot_clear_transcript(self):
+        self._copilot_lines   = []
+        self._copilot_partial = ""
+        self._copilot_render_transcript()
+
+    def _copilot_set_placeholder(self):
+        self._copilot_render_transcript()
+
+    def _copilot_render_transcript(self):
+        """Render the transcript pane: finalized lines + the live partial line.
+        Falls back to a state-aware placeholder when nothing has been heard yet."""
+        txt = self._copilot_tr_text
+        if txt is None or self._copilot_editing:
+            return            # never repaint over an in-progress question edit
+        txt.config(state="normal")
+        txt.delete("1.0", "end")
+        if not self._copilot_lines and not self._copilot_partial:
+            st = self._copilot_status
+            if st == "listening":
+                msg = "Listening… speech appears here as you speak."
+            elif st.startswith("error"):
+                msg = "⚠  " + st[8:]
+            else:
+                msg = ("⏳  Loading the speech model — first run downloads it, this "
+                       "can take a minute. Transcript starts once it's ready.")
+            txt.insert("end", msg + "\n", "tr_line")
+        else:
+            for ln in self._copilot_lines[-10:]:
+                txt.insert("end", "•  " + ln + "\n", "tr_new")
+            if self._copilot_partial:
+                txt.insert("end", "▶  " + self._copilot_partial + "…", "tr_partial")
+        txt.see("end")
+        txt.config(state="disabled")
+
+    def _copilot_on_utterance(self, text):
+        """A finalized sentence → commit it as a transcript line, clear the partial."""
+        if not self._copilot_active:
+            return
+        self._copilot_lines.append(text)
+        self._copilot_lines = self._copilot_lines[-30:]
+        self._copilot_partial = ""
+        if self._copilot_editing:
+            # Approach A: while you edit, new speech lands at the END of the edit
+            # buffer without disturbing your caret — so the tail stays editable too.
+            self._copilot_edit_append(text)
+        else:
+            self._copilot_render_transcript()
+
+    def _copilot_on_partial(self, text):
+        """Live partial words (updates many times/sec) → refresh the partial line."""
+        if not self._copilot_active or not text:
+            return
+        self._copilot_partial = text
+        if self._copilot_editing:
+            # Don't inject the volatile partial into the editable text — show it as a
+            # dim live indicator in the pane hint instead.
+            self._copilot_tr_set_hint(
+                "🔊 " + (text[:42] + "…" if len(text) > 42 else text))
+        else:
+            self._copilot_render_transcript()
+
+    # ── editable question panel (click a word → fix → Enter sends) ─────────────
+    def _copilot_tr_set_hint(self, text=None):
+        if self._copilot_tr_hint is not None:
+            self._copilot_tr_hint.config(
+                text=self._COPILOT_TR_HINT if text is None else text)
+
+    def _copilot_tr_click(self, event):
+        """Single click in the transcript pane → edit the pending question.
+        Only while listening/idle (never mid-answer), and only if there's a pending
+        question to send. A disabled tk.Text still delivers <Button-1>."""
+        if (not self._copilot_active or self._copilot_editing
+                or self._copilot is None
+                or self._copilot_status not in ("listening", "idle")):
+            return
+        lines = self._copilot.pending_lines()
+        if not lines:
+            return                       # nothing pending — nothing to edit/send
+        self._copilot_enter_edit(lines, event)
+        return "break"
+
+    def _copilot_enter_edit(self, lines, event):
+        self._copilot_editing = True
+        txt = self._copilot_tr_text
+        # insertbackground = caret colour; default is black → invisible on the dark
+        # pane, so force a bright near-white caret while editing.
+        txt.config(state="normal", insertwidth=2, cursor="xterm",
+                   insertbackground=C["on_s"])
+        txt.delete("1.0", "end")
+        txt.insert("end", "\n".join(lines))     # one utterance per line
+        try:                                     # caret near the click (tk clamps)
+            txt.mark_set("insert", txt.index(f"@{event.x},{event.y}"))
+        except tk.TclError:
+            txt.mark_set("insert", "end")
+        txt.focus_set()
+        txt.see("insert")
+        # Instance bindings fire before the class binding, so returning "break"
+        # both sends and suppresses the newline the Text would otherwise insert.
+        txt.bind("<Return>",   self._copilot_commit_edit)
+        txt.bind("<KP_Enter>", self._copilot_commit_edit)
+        txt.bind("<Escape>",   self._copilot_cancel_edit)
+        self._copilot_tr_set_hint("✎ editing — Enter sends · Esc cancels")
+        self._copilot_update_header()
+
+    def _copilot_edit_append(self, text):
+        """Append a finalized utterance to the end of the edit buffer, keeping the
+        user's caret and viewport put (Approach A)."""
+        txt = self._copilot_tr_text
+        saved   = txt.index("insert")
+        at_tail = txt.compare("insert", ">=", "end-1c")
+        txt.insert("end", "\n" + text)
+        txt.mark_set("insert", saved)            # don't let the append drag the caret
+        if at_tail:
+            self._copilot_tr_set_hint("▼ new speech added below")
+        else:
+            txt.see("insert")                    # stay where they're editing
+
+    def _copilot_commit_edit(self, event=None):
+        """Enter → send exactly what's in the box (collapsing it to one question),
+        clearing pending so mid-edit utterances aren't double-counted."""
+        if not self._copilot_editing:
+            return "break"
+        raw = self._copilot_tr_text.get("1.0", "end-1c")
+        question = " ".join(raw.split())
+        self._copilot_exit_edit()
+        if question and self._copilot is not None:
+            self._copilot.trigger_with(question)
+        return "break"
+
+    def _copilot_cancel_edit(self, event=None):
+        """Esc → discard the edit, restore the live transcript view."""
+        if not self._copilot_editing:
+            return "break"
+        self._copilot_exit_edit()
+        self._copilot_render_transcript()
+        return "break"
+
+    def _copilot_exit_edit(self):
+        self._copilot_editing = False
+        txt = self._copilot_tr_text
+        for seq in ("<Return>", "<KP_Enter>", "<Escape>"):
+            txt.unbind(seq)
+        txt.config(insertwidth=0, cursor="arrow", state="disabled")
+        self._copilot_tr_set_hint(None)
+        self.root.focus_set()            # hand Enter back to the global trigger
+        self._copilot_update_header()
+
+    def _copilot_render(self):
+        """Paint the copilot view into the active card (idle / transcript state)."""
+        self._prev_card.grid_remove()
+        self._next_card.grid_remove()
+        self._copilot_update_header()
+        # The live transcript lives in its own pane above; self.text is the ANSWER
+        # area. When no answer has streamed yet, show a short hint here.
+        self.text.config(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("end", "✦  ANSWER\n", "prompt_header")
+        if self._copilot_device:
+            self._insert_rich(
+                f"Capturing from: **{self._copilot_device}**", "body")
+        self.text.insert(
+            "end",
+            "\nWatch the live transcript above. When you hear a question, press  "
+            "Enter  — the answer streams in here, invisible to screen capture.",
+            "body")
+        self.text.config(state="disabled")
+
+    def _register_copilot_hotkey(self):
+        # When the overlay HAS focus: plain Enter = answer, F10 = new conversation.
+        self.root.bind("<Return>", lambda e: self._copilot_trigger())
+        self.root.bind("<F10>",    lambda e: self._copilot_reset())
+        # Global (overlay NOT focused, e.g. meeting window in front): use Ctrl+Enter
+        # so it can't misfire on every plain Enter you type elsewhere. (Fn is
+        # firmware-level and invisible to software, so Fn+Enter can't be hooked.)
+        self._copilot_hotkey_handle = None
+        try:
+            import keyboard
+            keyboard.add_hotkey("ctrl+enter", lambda: self.root.after(0, self._copilot_trigger))
+            keyboard.add_hotkey("f10",        lambda: self.root.after(0, self._copilot_reset))
+            self._copilot_hotkey = True
+        except Exception as e:                       # noqa: BLE001
+            self._copilot_hotkey = False
+            print(f"[Copilot] global Ctrl+Enter/F10 hotkeys unavailable "
+                  f"({type(e).__name__}: {e}). Plain Enter still works when the "
+                  f"overlay is focused.")
+
+    def _unregister_copilot_hotkey(self):
+        self.root.unbind("<Return>")
+        self.root.unbind("<F10>")
+        if self._copilot_hotkey:
+            # unhook_all() removes our f9 + f10 hotkeys AND tears down keyboard's
+            # global low-level hook + listener thread, so the global keyboard hook
+            # dies with copilot mode rather than only when the process exits.
+            try:
+                import keyboard
+                keyboard.unhook_all()
+            except Exception:                        # noqa: BLE001
+                pass
+            self._copilot_hotkey = False
+            self._copilot_hotkey_handle = None
+
     # ── SETTINGS POPUP ───────────────────────────────────────────────────────
 
     def _open_settings(self):
@@ -1248,7 +2421,7 @@ class OverlayApp:
             text=f"{int(self.root.attributes('-alpha')*100)}%", **_lbl)
         self._op_label.pack(side="right")
 
-        tk.Scale(win, from_=20, to=100, resolution=1, orient="horizontal",
+        tk.Scale(win, from_=0, to=100, resolution=1, orient="horizontal",
                  showvalue=False, bg=C["prompt"], troughcolor=C["outline"],
                  highlightthickness=0, bd=0, sliderrelief="flat",
                  activebackground=C["primary"], command=self._on_opacity
@@ -1385,10 +2558,38 @@ class OverlayApp:
         print(f"WebSocket server on {ip}:{port}")
 
     def _on_opacity(self, val):
-        v = int(val)
+        v = int(float(val))
         self.root.attributes("-alpha", v / 100)
-        if hasattr(self, "_op_label"):
-            self._op_label.config(text=f"{v}%")
+        pct = f"{v}%"
+        if hasattr(self, "_op_label") and self._op_label.winfo_exists():
+            self._op_label.config(text=pct)
+        if hasattr(self, "_top_op_label") and self._top_op_label.winfo_exists():
+            self._top_op_label.config(text=pct)
+        if hasattr(self, "_top_op_scale") and self._top_op_scale.winfo_exists():
+            if abs(self._top_op_scale.get() - v) > 1:
+                self._top_op_scale.set(v)
+
+    # Alt+D / Alt+I stops: 10% steps down to 20, then finer 5% steps to 0.
+    OPACITY_STEPS = (0, 5, 10, 15, 20, 30, 40, 50, 60, 70, 80, 90, 100)
+
+    def _adjust_opacity(self, delta):
+        try:
+            if hasattr(self, "_top_op_scale") and self._top_op_scale.winfo_exists():
+                curr = int(self._top_op_scale.get())
+            else:
+                curr = int(round(self.root.attributes("-alpha") * 100))
+        except Exception:
+            curr = 95
+        # Next stop in the pressed direction (works from any slider value too).
+        if delta < 0:
+            new_val = max((s for s in self.OPACITY_STEPS if s < curr), default=0)
+        else:
+            new_val = min((s for s in self.OPACITY_STEPS if s > curr), default=100)
+        self._on_opacity(new_val)
+        if hasattr(self, "_breadcrumb") and self._breadcrumb.winfo_exists():
+            self._breadcrumb.config(text=f"WINDOW OPACITY: {new_val}%", fg=C["primary"])
+            self.root.after(1500, self._update_statusbar)
+        print(f"[Opacity] Changed to {new_val}%")
 
     # ── RESIZE HANDLES ───────────────────────────────────────────────────────
 
@@ -1439,6 +2640,10 @@ class OverlayApp:
         self._prev_text.config(font=(SERIF, self.font_size - 2, "italic"))
         self._next_text.config(font=(SANS,  self.font_size - 2))
         self.text.config(font=(SANS, self.font_size))
+        # Copilot owns the card — the font/tags already updated live; don't repaint
+        # the slide over the streaming answer (same guard as _apply_remote_content).
+        if self._copilot_active:
+            return
         self.render_slide()
 
     # ── DRAG ─────────────────────────────────────────────────────────────────
@@ -1446,6 +2651,9 @@ class OverlayApp:
     def _start_drag(self, event):
         self._drag_x = event.x_root - self.root.winfo_x()
         self._drag_y = event.y_root - self.root.winfo_y()
+        # Pure-Tk move only: a native WM_NCLBUTTONDOWN/HTCAPTION SendMessage here
+        # enters a modal move loop that re-enters Tk callbacks while ctypes has
+        # released the GIL -> fatal "PyEval_RestoreThread" crash, no drag.
 
     def _do_drag(self, event):
         self.root.geometry(
@@ -1457,24 +2665,302 @@ class OverlayApp:
         self.root.bind("<Left>",   lambda e: self.navigate(-1))
         self.root.bind("<Right>",  lambda e: self.navigate(1))
         self.root.bind("<Escape>", self._handle_escape)
+        self.root.bind("<Control-Shift-Q>", lambda e: self._on_screenshot_hotkey())
+        self.root.bind("<Control-Shift-q>", lambda e: self._on_screenshot_hotkey())
+        self.root.bind("<F2>", lambda e: self._toggle_readonly())
+        self.root.bind("<Control-e>", lambda e: self._toggle_readonly())
+        self.root.bind("<Control-E>", lambda e: self._toggle_readonly())
+
+        # Alt+D to decrease opacity, Alt+I to increase opacity (10% step)
+        # Also Ctrl+[ to decrease, Ctrl+] to increase
+        for seq in (
+            "<Alt-d>", "<Alt-D>", "<Alt-Key-d>", "<Alt-Key-D>",
+            "<Mod1-d>", "<Mod1-D>", "<Control-bracketleft>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: (self._adjust_opacity(-10), "break")[-1])
+                self.root.bind_all(seq, lambda e: (self._adjust_opacity(-10), "break")[-1])
+            except Exception:
+                pass
+
+        for seq in (
+            "<Alt-i>", "<Alt-I>", "<Alt-Key-i>", "<Alt-Key-I>",
+            "<Mod1-i>", "<Mod1-I>", "<Control-bracketright>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: (self._adjust_opacity(10), "break")[-1])
+                self.root.bind_all(seq, lambda e: (self._adjust_opacity(10), "break")[-1])
+            except Exception:
+                pass
+
+        def _on_key_any(e):
+            is_alt = bool(e.state & 0x20000) or bool(e.state & 0x08)
+            if is_alt:
+                k = (e.keysym or "").lower()
+                if k == "d":
+                    self._adjust_opacity(-10)
+                    return "break"
+                elif k == "i":
+                    self._adjust_opacity(10)
+                    return "break"
+
+        self.root.bind_all("<KeyPress>", _on_key_any)
+        # System-wide opacity hotkeys come from _hotkey_loop (RegisterHotKey);
+        # the `keyboard` hook is only a fallback there — binding both here made
+        # one keypress fire twice (20% steps).
+
+        # In-app toggle show/hide visibility shortcuts
+        for seq in (
+            "<Control-grave>",
+            "<Control-asciitilde>",
+            "<Control-Shift-grave>",
+            "<Control-Shift-asciitilde>",
+            "<Control-quoteleft>",
+            "<Control-Shift-quoteleft>",
+            "<Control-h>",
+            "<Control-H>",
+            "<Control-Shift-h>",
+            "<Control-Shift-H>",
+        ):
+            try:
+                self.root.bind(seq, lambda e: self._toggle_visibility())
+            except Exception:
+                pass
+
+    def _on_screenshot_hotkey(self):
+        req_id = f"local_{int(time.time()*1000)}"
+        threading.Thread(target=self._capture_and_send_screenshot,
+                         args=(req_id,), daemon=True).start()
 
     def _handle_escape(self, event):
         if self._settings_win and self._settings_win.winfo_exists():
             self._settings_win.destroy()
+        elif self._copilot_active:
+            self._stop_copilot()
         elif self._logs_visible:
             self._hide_logs()
         else:
-            self.root.destroy()
+            self._quit()
+
+    # ── GLOBAL SHOW/HIDE HOTKEY (Ctrl+Shift+` / Ctrl+` / Ctrl+Shift+H) ───────
+
+    def _register_global_hotkey(self):
+        """Register system-wide hotkeys (Ctrl+Shift+`, Ctrl+`, Ctrl+Shift+H, Ctrl+H)
+        that toggle the overlay's visibility even when another window is focused.
+        Uses Win32 RegisterHotKey via ctypes — no extra dependency, works in both
+        Python and the packaged standalone .exe."""
+        try:
+            self._hotkey_thread = threading.Thread(
+                target=self._hotkey_loop, name="global-hotkey", daemon=True)
+            self._hotkey_thread.start()
+        except Exception as e:               # noqa: BLE001 — never block startup
+            print(f"[Hotkey] could not start global hotkey thread: {e}")
+
+    def _hotkey_loop(self):
+        from ctypes import wintypes
+        user32 = self._user32
+        user32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                       wintypes.HWND, wintypes.UINT, wintypes.UINT]
+        user32.GetMessageW.restype  = ctypes.c_int
+        user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                        wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+        user32.PeekMessageW.restype  = wintypes.BOOL
+
+        # Ensure the worker thread has a Win32 message queue established
+        dummy = wintypes.MSG()
+        user32.PeekMessageW(ctypes.byref(dummy), None, 0, 0, 0)
+
+        MOD_SHIFT, MOD_CONTROL, MOD_NOREPEAT = 0x0004, 0x0002, 0x4000
+        MOD_ALT   = 0x0001
+        VK_OEM_3  = 0xC0        # the ` / ~ key (backtick) on a standard keyboard
+        VK_H      = 0x48        # H key
+        VK_D      = 0x44        # D key
+        VK_I      = 0x49        # I key
+        VK_OEM_4  = 0xDB        # [ key
+        VK_OEM_6  = 0xDD        # ] key
+        WM_HOTKEY = 0x0312
+
+        HK_VIS_1   = 0xB1B
+        HK_VIS_2   = 0xB1C
+        HK_VIS_3   = 0xB1D
+        HK_VIS_4   = 0xB1E
+        HK_OP_DEC  = 0xB1F
+        HK_OP_INC  = 0xB20
+        HK_OP_DEC2 = 0xB21
+        HK_OP_INC2 = 0xB22
+        HK_OP_DEC3 = 0xB23
+        HK_OP_INC3 = 0xB24
+
+        candidates = [
+            (HK_VIS_1,   MOD_CONTROL | MOD_SHIFT, VK_OEM_3, "Ctrl+Shift+`"),
+            (HK_VIS_2,   MOD_CONTROL,             VK_OEM_3, "Ctrl+`"),
+            (HK_VIS_3,   MOD_CONTROL | MOD_SHIFT, VK_H,     "Ctrl+Shift+H"),
+            (HK_VIS_4,   MOD_CONTROL,             VK_H,     "Ctrl+H"),
+            (HK_OP_DEC,  MOD_ALT,                 VK_D,     "Alt+D"),
+            (HK_OP_INC,  MOD_ALT,                 VK_I,     "Alt+I"),
+            (HK_OP_DEC2, MOD_ALT | MOD_SHIFT,     VK_D,     "Alt+Shift+D"),
+            (HK_OP_INC2, MOD_ALT | MOD_SHIFT,     VK_I,     "Alt+Shift+I"),
+            (HK_OP_DEC3, MOD_CONTROL,             VK_OEM_4, "Ctrl+["),
+            (HK_OP_INC3, MOD_CONTROL,             VK_OEM_6, "Ctrl+]"),
+        ]
+
+        ERROR_HOTKEY_ALREADY_REGISTERED = 1409
+        registered_ids = []
+
+        def _register(cands):
+            """Register each candidate; return the ones refused as already taken."""
+            taken = []
+            for cand in cands:
+                hk_id, mods, vk, name = cand
+                # Try with MOD_NOREPEAT first, then fallback without it
+                if user32.RegisterHotKey(None, hk_id, mods | MOD_NOREPEAT, vk) or \
+                   user32.RegisterHotKey(None, hk_id, mods, vk):
+                    registered_ids.append(hk_id)
+                    continue
+                err = ctypes.get_last_error()
+                if err == ERROR_HOTKEY_ALREADY_REGISTERED:
+                    taken.append(cand)
+                else:
+                    print(f"[Hotkey] {name} registration skipped (error {err})")
+            return taken
+
+        # Error 1409 almost always means an earlier overlay (often hidden via
+        # Ctrl+H, so invisible and off the taskbar) still owns the keys — then
+        # Alt+D/Alt+I etc. silently drive THAT window, not this one. Newest
+        # launch wins: close the old instance and take the keys over.
+        taken = _register(candidates)
+        if taken and self._close_other_instances():
+            for _ in range(20):                  # wait up to ~2 s for it to exit
+                time.sleep(0.1)
+                taken = _register(taken)
+                if not taken:
+                    break
+            if not taken:
+                print("[Hotkey] Closed a previous overlay instance and took over its hotkeys.")
+        for _, _, _, name in taken:
+            print(f"[Hotkey] {name} registration skipped (already in use by another program)")
+
+        # Fallback: opacity keys RegisterHotKey couldn't take go through the
+        # `keyboard` low-level hook instead (no double-fire: only for failed ids).
+        fallback = [(hk, d) for hk_id, hk, d in ((HK_OP_DEC,  "alt+d",  -10),
+                                                 (HK_OP_INC,  "alt+i",   10),
+                                                 (HK_OP_DEC3, "ctrl+[", -10),
+                                                 (HK_OP_INC3, "ctrl+]",  10))
+                    if hk_id not in registered_ids]
+        if fallback:
+            try:
+                import keyboard
+                for hk, d in fallback:
+                    keyboard.add_hotkey(
+                        hk, lambda d=d: self.root.after(0, lambda: self._adjust_opacity(d)),
+                        suppress=False)
+                print(f"[Hotkey] keyboard-hook fallback for: {', '.join(h for h, _ in fallback)}")
+            except Exception as e:           # noqa: BLE001 — optional dependency
+                print(f"[Hotkey] keyboard-hook fallback unavailable: {e}")
+
+        if not registered_ids:
+            print("[Hotkey] Warning: All candidate global hotkeys failed to register.")
+            return
+
+        self._hotkey_ids = registered_ids
+
+        msg = wintypes.MSG()
+        while True:
+            r = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if r in (0, -1):                 # WM_QUIT or error
+                break
+            if msg.message == WM_HOTKEY and msg.wParam in registered_ids:
+                try:
+                    if msg.wParam in (HK_VIS_1, HK_VIS_2, HK_VIS_3, HK_VIS_4):
+                        self.root.after(0, self._toggle_visibility)
+                    elif msg.wParam in (HK_OP_DEC, HK_OP_DEC2, HK_OP_DEC3):
+                        self.root.after(0, lambda: self._adjust_opacity(-10))
+                    elif msg.wParam in (HK_OP_INC, HK_OP_INC2, HK_OP_INC3):
+                        self.root.after(0, lambda: self._adjust_opacity(10))
+                except Exception:            # noqa: BLE001 — root gone, stop the loop
+                    break
+
+        for hk_id in registered_ids:
+            try:
+                user32.UnregisterHotKey(None, hk_id)
+            except Exception:                    # noqa: BLE001
+                pass
+
+    def _close_other_instances(self):
+        """Ask every other overlay process's main window to close (WM_CLOSE runs
+        its normal _quit teardown). Matches Tk's toplevel class + our window
+        title, skipping this process. Returns how many were asked."""
+        from ctypes import wintypes
+        user32 = self._user32
+        user32.FindWindowExW.argtypes = [wintypes.HWND, wintypes.HWND,
+                                         wintypes.LPCWSTR, wintypes.LPCWSTR]
+        user32.FindWindowExW.restype  = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                                    ctypes.POINTER(wintypes.DWORD)]
+        user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
+                                        wintypes.WPARAM, wintypes.LPARAM]
+        WM_CLOSE = 0x0010
+        me, asked, hwnd = os.getpid(), 0, None
+        while True:
+            hwnd = user32.FindWindowExW(None, hwnd, "TkTopLevel", "AsusServiceOLED")
+            if not hwnd:
+                break
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            if pid.value and pid.value != me:
+                user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+                asked += 1
+                print(f"[Hotkey] asked previous overlay instance (PID {pid.value}) to close")
+        return asked
+
+    def _toggle_visibility(self):
+        """Hide the overlay, or bring it back on top and focus it."""
+        try:
+            is_viewable = False
+            try:
+                is_viewable = bool(self.root.winfo_viewable())
+            except Exception:
+                pass
+
+            if self._hidden or not is_viewable:
+                self.root.deiconify()
+                self.root.overrideredirect(True)      # stay borderless after re-show
+                self.root.attributes("-topmost", True)
+                self._cloak(self.root)                # re-assert capture cloaking
+                self.root.lift()
+                self.root.focus_force()
+                try:
+                    inner = self.root.winfo_id()
+                    hwnd = self._user32.GetParent(inner) or inner
+                    HWND_TOPMOST = -1
+                    SWP_NOMOVE = 0x0002
+                    SWP_NOSIZE = 0x0001
+                    SWP_SHOWWINDOW = 0x0040
+                    self._user32.SetWindowPos(
+                        hwnd, HWND_TOPMOST, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW
+                    )
+                    self._user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                self._hidden = False
+            else:
+                self.root.withdraw()
+                self._hidden = True
+        except (tk.TclError, Exception):
+            pass
 
 
 # ── .ENV LOADER ──────────────────────────────────────────────────────────────
 
 def _load_dotenv():
     """Load KEY=VALUE pairs from a .env file next to overlay.py (no external deps)."""
-    env_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    env_path = os.path.join(_app_dir(), ".env")
     if not os.path.exists(env_path):
         return
-    with open(env_path) as f:
+    # utf-8-sig strips a BOM — Windows Notepad writes UTF-8 with BOM by default,
+    # which would otherwise glue ﻿ onto the first key and break the lookup.
+    with open(env_path, encoding="utf-8-sig") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
@@ -1498,6 +2984,9 @@ def main():
     _load_dotenv()
     root = tk.Tk()
     app  = OverlayApp(root)
+    # Ensure copilot/STT child processes + global hotkey are torn down on any
+    # window-manager close, not just the in-app ✕ / Escape paths.
+    root.protocol("WM_DELETE_WINDOW", app._quit)
 
     args = sys.argv[1:]
 
@@ -1517,9 +3006,11 @@ def main():
         port = int(args[args.index("--port") + 1]) if "--port" in args else 8765
         app.start_local_ws_server(port)
         _print_local_ip(port)
-    elif args and not args[0].startswith("--"):
+
+    if args and not args[0].startswith("--"):
         app.load_file(args[0])
-    else:
+
+    if not app._sync_mode:
         # No CLI mode flag — auto-start from .env if values are present
         if os.environ.get("FIREBASE_URL"):
             print(f"Auto-connecting to Firebase from .env …")
@@ -1530,7 +3021,33 @@ def main():
             _print_local_ip(port)
 
     root.mainloop()
+    # mainloop returned -> the window is gone. _quit() already did best-effort
+    # teardown (engine.stop terminates the STT child, keyboard.unhook_all removes
+    # the global hook). But a surviving non-daemon RealtimeSTT child can still
+    # wedge multiprocessing's atexit join — leaving the PROCESS (and its audio
+    # capture) alive after the window closes, which is a privacy leak. Kill any
+    # child that's left, drop the keyboard hook, then force-exit so the process
+    # ALWAYS dies. Terminate BEFORE os._exit so the capture child isn't orphaned.
+    try:
+        import multiprocessing
+        for p in multiprocessing.active_children():
+            try:
+                p.terminate()
+            except Exception:            # noqa: BLE001
+                pass
+        for p in multiprocessing.active_children():
+            p.join(timeout=1.0)
+    except Exception:                    # noqa: BLE001
+        pass
+    try:
+        import keyboard
+        keyboard.unhook_all()
+    except Exception:                    # noqa: BLE001
+        pass
+    os._exit(0)                          # guarantee the red ✕ ends the script
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()   # safe under RealtimeSTT's spawn child procs
     main()

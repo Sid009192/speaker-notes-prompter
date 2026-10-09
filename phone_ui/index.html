@@ -500,15 +500,29 @@ main {
   white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word;
   tab-size: 2; background: transparent;
 }
-.hl-layer {
-  pointer-events: none; user-select: none;
-  color: var(--hl-body); margin: 0; overflow: hidden;
+/* contenteditable editor: one <div class="ln"> per markdown line, so image
+   lines can render the actual photo instead of their img:N token */
+.editor-ce { color: var(--hl-body); caret-color: var(--text-1); }
+.editor-ce .ln { position: relative; }
+.editor-ce ::selection { background: color-mix(in srgb, var(--primary) 28%, transparent); }
+.editor-ce.is-empty > .ln:first-child::before {
+  content: attr(data-placeholder); position: absolute; left: 0; top: 0;
+  color: var(--text-3); pointer-events: none;
 }
-.editor-ta {
-  color: transparent; -webkit-text-fill-color: transparent;
-  caret-color: var(--text-1); resize: none; overflow: hidden; z-index: 1;
+.ln-img { padding: 6px 0; user-select: none; }
+.img-wrap { position: relative; display: inline-block; max-width: 100%; vertical-align: top; }
+.img-wrap img {
+  display: block; max-width: 100%; max-height: 280px;
+  border-radius: var(--r-sm); border: 1px solid var(--outline);
 }
-.editor-ta::selection { background: color-mix(in srgb, var(--primary) 28%, transparent); }
+.img-del {
+  position: absolute; top: 6px; right: 6px;
+  width: 24px; height: 24px; border-radius: 50%;
+  background: rgba(0,0,0,.55); color: #fff; font-size: 12px; line-height: 24px;
+  opacity: 0; transition: opacity .15s;
+}
+.img-wrap:hover .img-del, .img-del:focus { opacity: 1; }
+@media (hover: none) { .img-del { opacity: .85; } }   /* touch: no hover, keep visible */
 
 /* Highlight classes */
 .hl-h1     { color: var(--hl-h1);     font-weight: 700; }
@@ -517,6 +531,8 @@ main {
 .hl-prompt { color: var(--hl-prompt); font-style: italic; }
 .hl-bold   { color: var(--hl-bold);   font-weight: 700; }
 .hl-body   { color: var(--hl-body); }
+/* an img:N token whose photo isn't loaded (e.g. typed by hand) stays as text */
+.hl-img    { color: var(--primary); }
 
 /* ── NOTES FOOTER ────────────────────────────────────────────────────────────── */
 .notes-footer {
@@ -587,6 +603,87 @@ main {
   font-size: 11px; color: var(--text-3); line-height: 1.5;
 }
 
+/* ── REMOTE CONTROL BAR ────────────────────────────────────────────────────── */
+.remote-bar {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 300;
+  background: color-mix(in srgb, var(--surface-1) 92%, transparent);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border-top: 1px solid var(--outline);
+  padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
+  display: none; flex-direction: column; gap: 10px;
+}
+.remote-bar.visible { display: flex; }
+
+.rc-row {
+  display: flex; align-items: center; gap: 8px;
+  justify-content: center;
+}
+
+.rc-btn {
+  display: flex; align-items: center; justify-content: center; gap: 4px;
+  background: var(--surface-3); border-radius: var(--r-md);
+  color: var(--text-1); font-family: var(--label);
+  font-size: 13px; font-weight: 700; letter-spacing: .03em;
+  padding: 10px 14px; min-width: 48px; min-height: 44px;
+  transition: background .12s, transform .08s, color .12s;
+  user-select: none; -webkit-user-select: none;
+  -webkit-tap-highlight-color: transparent;
+}
+.rc-btn:active { transform: scale(.92); background: var(--surface-4); }
+.rc-btn.primary { background: var(--primary-btn); color: #fff; }
+.rc-btn.primary:active { background: var(--primary-btn-h); }
+
+.rc-nav { flex: 1; }
+
+.rc-sep { width: 1px; height: 28px; background: var(--outline); flex-shrink: 0; }
+
+.rc-slider-group {
+  display: flex; align-items: center; gap: 8px; flex: 1;
+}
+.rc-slider-group .slider-lbl {
+  font-family: var(--label); font-size: 8.5px; font-weight: 700;
+  letter-spacing: .12em; color: var(--text-3); white-space: nowrap;
+}
+.rc-slider {
+  -webkit-appearance: none; appearance: none;
+  flex: 1; height: 4px;
+  background: linear-gradient(to right, var(--primary) 0%, var(--primary) var(--pct, 50%), var(--outline) var(--pct, 50%));
+  border-radius: 2px; outline: none;
+}
+.rc-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 20px; height: 20px; border-radius: 50%;
+  background: var(--primary); cursor: grab;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--primary) 20%, transparent);
+}
+.rc-slider::-moz-range-thumb {
+  width: 20px; height: 20px; border-radius: 50%; border: none;
+  background: var(--primary);
+}
+.rc-slider-val {
+  font-family: var(--label); font-size: 11px; font-weight: 700;
+  color: var(--text-2); min-width: 3.5ch; text-align: right;
+}
+
+.rc-header {
+  display: flex; align-items: center; justify-content: space-between;
+  padding-bottom: 8px; margin-bottom: 2px;
+  border-bottom: 1px solid var(--outline);
+}
+.rc-header-left { display: flex; align-items: center; gap: 8px; }
+.rc-icon {
+  width: 24px; height: 24px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-radius: var(--r-sm); display: grid; place-items: center; font-size: 12px;
+}
+.rc-title {
+  font-family: var(--serif); font-size: 14px; font-weight: 600; color: var(--text-1);
+}
+
+/* when remote bar is visible, give main bottom padding so content isn't hidden */
+body:has(.remote-bar.visible) main { padding-bottom: 140px; }
+
 /* ── RESPONSIVE ──────────────────────────────────────────────────────────────── */
 @media (max-width: 640px) {
   header { padding: 0 12px; gap: 8px; }
@@ -598,7 +695,130 @@ main {
   .editor-col > * { padding: 16px; font-size: 15px; }
   .notes-footer { padding-left: 56px; }
   .tool-btn::after { display: none; }
+  .rc-btn { padding: 10px 10px; font-size: 12px; }
 }
+
+/* ── SCREENSHOT CONTROLS & MODAL ────────────────────────────────────────── */
+.rc-screenshot-btn {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  background: color-mix(in srgb, var(--primary-btn) 25%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 40%, transparent);
+  color: var(--primary);
+  font-weight: 600;
+  transition: all .2s ease;
+}
+.rc-screenshot-btn:hover {
+  background: color-mix(in srgb, var(--primary-btn) 40%, transparent);
+  border-color: var(--primary);
+  transform: translateY(-1px);
+}
+.rc-screenshot-btn.is-snapping {
+  background: color-mix(in srgb, var(--gold) 20%, transparent);
+  border-color: var(--gold);
+  color: var(--gold);
+  pointer-events: none;
+  animation: pulse-border 1.2s infinite alternate;
+}
+.rc-btn-hint {
+  font-size: 10px;
+  opacity: 0.7;
+  font-family: var(--label);
+  letter-spacing: .05em;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--text-1) 12%, transparent);
+  margin-left: auto;
+}
+@keyframes pulse-border {
+  from { opacity: 0.7; transform: scale(0.99); }
+  to { opacity: 1; transform: scale(1); }
+}
+
+.screenshot-btn-hdr {
+  font-size: 15px;
+}
+.screenshot-btn-hdr.is-snapping {
+  animation: pulse-border 1s infinite alternate;
+  color: var(--gold);
+}
+
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 1000;
+  background: rgba(0, 0, 0, 0.78);
+  backdrop-filter: blur(8px);
+  display: flex; align-items: center; justify-content: center;
+  padding: 16px;
+  opacity: 0; pointer-events: none;
+  transition: opacity .25s ease;
+}
+.modal-overlay.open {
+  opacity: 1; pointer-events: auto;
+}
+.modal-card {
+  background: var(--surface-1);
+  border: 1px solid var(--outline);
+  border-radius: var(--r-md);
+  box-shadow: 0 20px 48px rgba(0,0,0,0.6);
+  max-width: 900px; width: 100%;
+  max-height: 90vh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+  animation: modal-pop .25s cubic-bezier(.16,1,.3,1);
+}
+@keyframes modal-pop {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: scale(1); opacity: 1; }
+}
+.modal-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--outline);
+  display: flex; align-items: center; justify-content: space-between;
+}
+.modal-title-wrap { display: flex; align-items: center; gap: 8px; font-weight: 600; font-size: 14px; color: var(--text-1); }
+.modal-close-btn { font-size: 16px; color: var(--text-2); padding: 4px 8px; border-radius: var(--r-sm); }
+.modal-close-btn:hover { color: var(--text-1); background: var(--surface-2); }
+.modal-body {
+  padding: 16px; overflow-y: auto; display: flex; flex-direction: column; align-items: center; gap: 12px;
+}
+.shot-img-container {
+  width: 100%; max-height: 60vh; overflow: auto; border-radius: var(--r-sm); border: 1px solid var(--outline);
+  background: #08080c; display: flex; justify-content: center;
+}
+.shot-img-container img { max-width: 100%; height: auto; object-fit: contain; }
+.modal-status-badge {
+  font-size: 12px; color: var(--green); font-weight: 500; display: flex; align-items: center; gap: 6px;
+}
+.modal-footer {
+  padding: 12px 18px; border-top: 1px solid var(--outline); display: flex; justify-content: flex-end; gap: 10px;
+}
+.modal-btn {
+  padding: 8px 16px; border-radius: var(--r-sm); font-size: 13px; font-weight: 500; cursor: pointer; transition: all .15s;
+}
+.modal-btn.secondary { background: var(--surface-2); color: var(--text-1); border: 1px solid var(--outline); }
+.modal-btn.secondary:hover { background: var(--surface-3); }
+.modal-btn.primary { background: var(--primary-btn); color: #fff; }
+.modal-btn.primary:hover { background: var(--primary-btn-h); }
+
+.toast-box {
+  position: fixed; bottom: 24px; left: 50%; transform: translateX(-50%);
+  z-index: 1100; display: flex; flex-direction: column; gap: 8px; pointer-events: none;
+}
+.toast-msg {
+  padding: 10px 18px; border-radius: var(--r-md); font-size: 13px; font-weight: 500;
+  box-shadow: 0 8px 24px rgba(0,0,0,0.45); pointer-events: auto;
+  display: flex; align-items: center; gap: 8px;
+  animation: toast-in .25s ease, toast-out .25s ease 3.75s forwards;
+}
+.toast-msg.success { background: #13271b; color: #6ee7b7; border: 1px solid #1f5038; }
+.toast-msg.info { background: #16203a; color: #93c5fd; border: 1px solid #233e72; }
+.toast-msg.warn { background: #2f2510; color: #fde047; border: 1px solid #634a17; }
+.toast-msg.error { background: #321616; color: #fca5a5; border: 1px solid #6b2121; }
+@keyframes toast-in { from { opacity: 0; transform: translateY(12px); } to { opacity: 1; transform: translateY(0); } }
+@keyframes toast-out { from { opacity: 1; transform: translateY(0); } to { opacity: 0; transform: translateY(-12px); } }
   </style>
 </head>
 <body>
@@ -628,6 +848,7 @@ main {
   </div>
 
   <div class="header-right">
+    <button class="icon-btn screenshot-btn-hdr" id="hdr-screenshot-btn" onclick="triggerScreenshot()" title="Take Presenter Screenshot (Ctrl+Shift+Q)">📸</button>
     <button class="icon-btn" id="theme-btn" onclick="toggleTheme()" title="Toggle theme">🌙</button>
   </div>
 </header>
@@ -716,14 +937,17 @@ main {
         <div class="tool-sep"></div>
         <button class="tool-btn" onclick="insertBullet()"   data-tip="BULLET">≡</button>
         <button class="tool-btn" onclick="insertPrompt()"   data-tip="PROMPT" style="font-size:15px">›</button>
+        <div class="tool-sep"></div>
+        <button class="tool-btn" onclick="pickImage()"      data-tip="IMAGE">🖼</button>
       </div>
+      <input type="file" id="img-input" accept="image/*" style="display:none"
+             onchange="if(this.files[0])handleImageFile(this.files[0]); this.value='';">
 
       <div class="editor-outer">
         <div class="editor-col" id="editor-col">
-          <pre class="hl-layer" id="hl-layer" aria-hidden="true"></pre>
-          <textarea class="editor-ta" id="editor"
-                    spellcheck="true"
-                    placeholder="Begin articulating your vision here…"></textarea>
+          <div class="editor-ce" id="editor" contenteditable="true"
+               spellcheck="true" role="textbox" aria-multiline="true"
+               data-placeholder="Begin articulating your vision here…"></div>
         </div>
       </div>
     </div>
@@ -740,6 +964,76 @@ main {
 
 </main>
 
+<!-- ══ REMOTE CONTROL BAR ═══════════════════════════════════════════════════ -->
+<div class="remote-bar" id="remote-bar">
+  <div class="rc-header">
+    <div class="rc-header-left">
+      <div class="rc-icon">🎛</div>
+      <span class="rc-title">Control Panel</span>
+    </div>
+    <button class="help-btn" id="rc-help-btn" title="What is this?">?</button>
+  </div>
+  <div class="rc-row">
+    <button class="rc-btn rc-nav" onclick="sendCmd({cmd:'navigate',delta:-1})">◀ Prev</button>
+    <button class="rc-btn rc-nav primary" onclick="sendCmd({cmd:'navigate',delta:1})">Next ▶</button>
+    <div class="rc-sep"></div>
+    <button class="rc-btn" onclick="sendCmd({cmd:'font',delta:-1})">A−</button>
+    <button class="rc-btn" onclick="sendCmd({cmd:'font',delta:1})">A+</button>
+  </div>
+  <div class="rc-row">
+    <div class="rc-slider-group">
+      <span class="slider-lbl">SCROLL</span>
+      <button class="rc-btn rc-scroll-btn" id="rc-scroll-up" title="Scroll up (hold to keep scrolling)">▲</button>
+      <button class="rc-btn rc-scroll-btn" id="rc-scroll-down" title="Scroll down (hold to keep scrolling)">▼</button>
+      <input type="range" class="rc-slider" id="rc-scroll"
+             min="0" max="100" value="0"
+             oninput="onScrollSlider(this)" />
+    </div>
+  </div>
+  <div class="rc-row">
+    <div class="rc-slider-group">
+      <span class="slider-lbl">OPACITY</span>
+      <input type="range" class="rc-slider" id="rc-opacity"
+             min="20" max="100" value="93"
+             oninput="onOpacitySlider(this)" />
+      <span class="rc-slider-val" id="rc-opacity-val">93%</span>
+    </div>
+  </div>
+  <div class="rc-row">
+    <button class="rc-btn rc-screenshot-btn" id="rc-screenshot-btn" onclick="triggerScreenshot()" title="Take Screenshot of presenter screen (Ctrl+Shift+Q)">
+      <span class="rc-btn-icon">📸</span>
+      <span class="rc-btn-text" id="rc-shot-text">Take Screenshot</span>
+      <span class="rc-btn-hint">Ctrl+Shift+Q</span>
+    </button>
+  </div>
+</div>
+
+<!-- ══ SCREENSHOT PREVIEW MODAL ═════════════════════════════════════════════ -->
+<div class="modal-overlay" id="shot-modal" onclick="if(event.target===this)closeShotModal()">
+  <div class="modal-card">
+    <div class="modal-head">
+      <div class="modal-title-wrap">
+        <span class="modal-icon">📸</span>
+        <span class="modal-title">Presenter Screen Captured</span>
+      </div>
+      <button class="modal-close-btn" onclick="closeShotModal()">✕</button>
+    </div>
+    <div class="modal-body">
+      <div class="shot-img-container">
+        <img id="shot-preview-img" alt="Captured screen" />
+      </div>
+      <div class="modal-status-badge" id="modal-status-badge">✓ Copied to clipboard</div>
+    </div>
+    <div class="modal-footer">
+      <button class="modal-btn secondary" onclick="downloadScreenshot()">⬇ Download</button>
+      <button class="modal-btn primary" id="modal-copy-btn" onclick="reCopyScreenshot()">📋 Copy to Clipboard</button>
+    </div>
+  </div>
+</div>
+
+<!-- ══ TOAST NOTIFICATION ═══════════════════════════════════════════════════ -->
+<div class="toast-box" id="toast-box"></div>
+
 <script>
 // ── STATE ─────────────────────────────────────────────────────────────────────
 let slides = [""], currentSlide = 0, mode = "firebase";
@@ -749,8 +1043,286 @@ let fbPollTimer = null, lastRemoteText = null;   // two-way sync: pick up overla
 let lastTypedAt = 0;                             // suppress remote pull right after local typing
 let presenceTimer = null;                        // heartbeat so the overlay knows we're here
 
-const editor       = document.getElementById("editor");
-const hlLayer      = document.getElementById("hl-layer");
+// ── IMAGE TOKENS ──────────────────────────────────────────────────────────────
+// A photo is ~100 KB of base64. The overlay needs that full ![..](data:...) line,
+// but showing it in the textarea buries the notes. So the textarea holds a short
+// token — ![photo 3](img:3) — and the data URL lives here. collapseImages() runs on
+// everything coming IN (remote loads, pastes); serialize() expands tokens on the
+// way OUT, so the synced wire format (and the overlay/exe) is unchanged. The
+// editor renders a token line as the photo itself (see EDITOR below).
+const imgById = new Map();   // "3"      → "data:image/jpeg;base64,..."
+const idByImg = new Map();   // data URL → "3"   (reuse ids so remote echoes don't renumber)
+let   imgSeq  = 0;
+const DATA_IMG_RE  = /!\[([^\]]*)\]\((data:image\/[^)]+)\)/g;
+const IMG_TOKEN_RE = /!\[([^\]]*)\]\(img:(\d+)\)/g;
+
+function registerImage(dataUrl){
+  const cleanUrl = dataUrl.replace(/\s+/g, "");
+  let id = idByImg.get(cleanUrl);
+  if(!id){ id = String(++imgSeq); imgById.set(id, cleanUrl); idByImg.set(cleanUrl, id); }
+  return id;
+}
+function collapseImages(text){
+  if(!text) return "";
+  return text.replace(DATA_IMG_RE, (m, alt, url) => {
+    const id = registerImage(url);
+    const label = (!alt || alt === "image") ? `photo ${id}` : alt;
+    return `![${label}](img:${id})`;
+  });
+}
+function expandImages(text){
+  // unknown ids (e.g. a token typed by hand) are left as-is; the overlay skips them
+  return text.replace(IMG_TOKEN_RE, (m, alt, id) =>
+    imgById.has(id) ? `![${alt}](${imgById.get(id)})` : m);
+}
+// The full text that goes over Firebase / the local bridge.
+function serialize(){ return expandImages(slides.join("\n---\n")); }
+
+// ── EDITOR ────────────────────────────────────────────────────────────────────
+// A contenteditable <div> holding one <div class="ln"> per markdown line, so an
+// image token line can show the photo itself. The rest of the page talks to it
+// through `editor`, which mimics the old <textarea> API (value, selectionStart/
+// End as plain-text offsets, setSelectionRange, focus, addEventListener).
+const editorEl = document.getElementById("editor");
+const IMG_LINE_RE = /^!\[([^\]]*)\]\(img:(\d+)\)$/;
+let lastSel = {start: 0, end: 0};   // survives blur (e.g. a toolbar tap)
+let composing = false;              // IME composition in progress (mobile keyboards)
+
+// DOM → markdown text. Block elements (div/p) and <br> end lines; a photo block
+// contributes its token. Tolerates the odd DOM browsers create while editing.
+function domText(root){
+  const lines = [""];
+  let pending = false;                    // a block just ended → next content on a new line
+  const cur = () => lines[lines.length - 1];
+  const brk = () => { lines.push(""); pending = false; };
+  const isBlock = n => n.nodeType === 1 && (n.tagName === "DIV" || n.tagName === "P");
+  (function walk(node){
+    for(const c of node.childNodes){
+      if(c.nodeType === 3){
+        const t = c.nodeValue.replace(/​/g, "").replace(/ /g, " ");
+        if(!t) continue;
+        if(pending) brk();
+        lines[lines.length - 1] += t;
+      } else if(c.nodeType === 1){
+        if(c.classList.contains("ln-img")){
+          if(pending || cur() !== "") brk();
+          lines[lines.length - 1] = c.dataset.src;
+          pending = true;
+        } else if(c.tagName === "BR"){
+          // a trailing <br> only keeps an empty block open; it isn't a line break
+          if(isBlock(node) && !c.nextSibling) continue;
+          if(pending) brk();
+          brk();
+        } else if(isBlock(c)){
+          if(pending || cur() !== "") brk();
+          walk(c);
+          pending = true;
+        } else {
+          walk(c);                          // inline wrapper (span, b, font…)
+        }
+      }
+    }
+  })(root);
+  return lines.join("\n");
+}
+
+function lineClass(r){
+  if(/^# /.test(r))  return "hl-h1";
+  if(/^## /.test(r)) return "hl-h2";
+  if(/^!\[[^\]]*\]\(/.test(r)) return "hl-img";
+  if(/^[-*] /.test(r)) return "hl-bullet";
+  if(/^> /.test(r))  return "hl-prompt";
+  return "hl-body";
+}
+function lineHtml(r){
+  if(r === "") return "<br>";
+  const e = esc(r);
+  return lineClass(r) === "hl-body"
+    ? e.replace(/\*\*(.+?)\*\*/g, '<span class="hl-bold">**$1**</span>') : e;
+}
+function isImgLine(r){
+  const m = r.match(IMG_LINE_RE);
+  return !!(m && imgById.has(m[2]));
+}
+function makeLine(r){
+  const d = document.createElement("div");
+  if(isImgLine(r)){
+    const [, alt, id] = r.match(IMG_LINE_RE);
+    d.className = "ln ln-img"; d.contentEditable = "false"; d.dataset.src = r;
+    const wrap = document.createElement("span"); wrap.className = "img-wrap";
+    const im = document.createElement("img");
+    im.src = imgById.get(id); im.alt = alt; im.draggable = false;
+    const x = document.createElement("button");
+    x.type = "button"; x.className = "img-del"; x.textContent = "✕"; x.title = "Remove photo";
+    x.addEventListener("mousedown", e => e.preventDefault());
+    x.addEventListener("click", () => removeImgLine(d));
+    wrap.append(im, x); d.append(wrap);
+  } else {
+    d.className = "ln " + lineClass(r);
+    d.innerHTML = lineHtml(r);
+  }
+  return d;
+}
+function lineMatches(el, r){
+  if(el.nodeType !== 1 || el.tagName !== "DIV") return false;
+  if(el.classList.contains("ln-img")) return isImgLine(r) && el.dataset.src === r;
+  return !isImgLine(r) && el.className === "ln " + lineClass(r) && el.innerHTML === lineHtml(r);
+}
+// Bring the DOM in line with `value`, touching only lines that differ (keeps
+// photos decoded and native undo intact for plain typing).
+function renderLines(value){
+  const lines = value.split("\n");
+  const kids = editorEl.childNodes;
+  const clean = [...kids].every(k => k.nodeType === 1 && k.tagName === "DIV" && k.classList.contains("ln"));
+  if(!clean){
+    editorEl.replaceChildren(...lines.map(makeLine));
+  } else {
+    lines.forEach((r, i) => {
+      const k = kids[i];
+      if(!k) editorEl.appendChild(makeLine(r));
+      else if(!lineMatches(k, r)) k.replaceWith(makeLine(r));
+    });
+    while(kids.length > lines.length) editorEl.lastChild.remove();
+  }
+  const empty = value === "";
+  editorEl.classList.toggle("is-empty", empty);
+  if(empty) editorEl.firstChild.dataset.placeholder = editorEl.dataset.placeholder;
+}
+
+// Plain-text offset of a DOM boundary point inside the editor.
+function offsetOf(node, off){
+  if(node === editorEl){
+    const n = editorEl.childNodes.length;
+    const box = document.createElement("div");
+    [...editorEl.childNodes].slice(0, off).forEach(c => box.appendChild(c.cloneNode(true)));
+    const t = domText(box).length;
+    return (off > 0 && off < n) ? t + 1 : t;   // before line `off` = after its newline
+  }
+  const r = document.createRange();
+  r.setStart(editorEl, 0); r.setEnd(node, off);
+  const box = document.createElement("div");
+  box.appendChild(r.cloneContents());
+  return domText(box).length;
+}
+function selInEditor(){
+  const s = window.getSelection();
+  return !!(s && s.rangeCount && editorEl.contains(s.anchorNode) && editorEl.contains(s.focusNode));
+}
+function getSel(){
+  if(!selInEditor()) return lastSel;
+  const r = window.getSelection().getRangeAt(0);
+  const a = offsetOf(r.startContainer, r.startOffset);
+  const b = r.collapsed ? a : offsetOf(r.endContainer, r.endOffset);
+  return (lastSel = {start: a, end: b});
+}
+// Plain-text offset → DOM point (expects the normalized one-div-per-line DOM).
+function pointAt(off){
+  const kids = editorEl.children;
+  for(let i = 0; i < kids.length; i++){
+    const k = kids[i];
+    const img = k.classList.contains("ln-img");
+    const len = img ? k.dataset.src.length : k.textContent.length;
+    if(off <= len){
+      if(img) return off === 0 ? [editorEl, i] : [editorEl, i + 1];
+      const tw = document.createTreeWalker(k, NodeFilter.SHOW_TEXT);
+      let n, rem = off;
+      while((n = tw.nextNode())){ if(rem <= n.length) return [n, rem]; rem -= n.length; }
+      return [k, 0];
+    }
+    off -= len + 1;
+  }
+  return [editorEl, kids.length];
+}
+function setSel(a, b){
+  const len = domText(editorEl).length;
+  a = Math.max(0, Math.min(a, len)); b = Math.max(a, Math.min(b, len));
+  if(document.activeElement !== editorEl) editorEl.focus({preventScroll: true});
+  const [sn, so] = pointAt(a), [en, eo] = pointAt(b);
+  const r = document.createRange();
+  r.setStart(sn, so); r.setEnd(en, eo);
+  const s = window.getSelection();
+  s.removeAllRanges(); s.addRange(r);
+  lastSel = {start: a, end: b};
+}
+document.addEventListener("selectionchange", () => { if(selInEditor() && !composing) getSel(); });
+
+// A photo line is contenteditable=false, so browsers often can't carry the caret
+// across it with ↑/↓/←/→ (it just sticks). If the native move did nothing, step
+// over the photo ourselves.
+function lineBounds(val){      // [{s: start offset, e: end offset}] per line
+  let o = 0;
+  return val.split("\n").map(t => { const b = {s: o, e: o + t.length, t}; o += t.length + 1; return b; });
+}
+function hopPhoto(key, shift){
+  const val = editor.value, L = lineBounds(val);
+  const {start, end} = getSel();
+  const from = (shift && lastAnchor === end) ? start : end;   // the moving end
+  let i = L.findIndex(b => from >= b.s && from <= b.e);
+  if(i < 0) return false;
+  const col = from - L[i].s;
+  const isImg = b => isImgLine(b.t);
+  let target = null;
+  if(key === "ArrowUp" || key === "ArrowLeft"){
+    let j = i - 1; while(j >= 0 && isImg(L[j])) j--;
+    if(key === "ArrowLeft"){ if(col !== 0) return false; if(j < 0 || j === i - 1) return false; target = L[j].e; }
+    else { if(j < 0) target = 0; else target = L[j].s + Math.min(col, L[j].t.length); }
+  } else {
+    let j = i + 1; while(j < L.length && isImg(L[j])) j++;
+    if(key === "ArrowRight"){ if(col !== L[i].t.length) return false; if(j >= L.length || j === i + 1) return false; target = L[j].s; }
+    else { if(j >= L.length) target = val.length; else target = L[j].s + Math.min(col, L[j].t.length); }
+  }
+  if(shift){ const a = lastAnchor ?? start; setSel(Math.min(a, target), Math.max(a, target)); }
+  else setSel(target, target);
+  return true;
+}
+let lastAnchor = null;   // fixed end of a shift-extended selection
+editorEl.addEventListener("keydown", e => {
+  if(!["ArrowUp","ArrowDown","ArrowLeft","ArrowRight"].includes(e.key)) return;
+  if(e.ctrlKey || e.metaKey || e.altKey || composing) return;
+  const before = getSel();
+  if(!e.shiftKey) lastAnchor = null;
+  else if(lastAnchor === null) lastAnchor = before.start;
+  const key = e.key, shift = e.shiftKey;
+  setTimeout(() => {                       // after the browser's own move
+    const after = getSel();
+    if(after.start === before.start && after.end === before.end) hopPhoto(key, shift);
+  }, 0);
+});
+
+const editor = {
+  get value(){ return domText(editorEl); },
+  set value(v){
+    const keep = selInEditor() ? getSel() : null;
+    renderLines(v);
+    if(keep) setSel(keep.start, keep.end);
+  },
+  get selectionStart(){ return getSel().start; },
+  get selectionEnd(){ return getSel().end; },
+  set selectionStart(v){ setSel(v, Math.max(v, getSel().end)); },
+  set selectionEnd(v){ setSel(Math.min(getSel().start, v), v); },
+  setSelectionRange(a, b){ setSel(a, b); },
+  focus(){
+    if(document.activeElement === editorEl) return;
+    editorEl.focus({preventScroll: true});
+    setSel(lastSel.start, lastSel.end);
+  },
+  addEventListener(...args){ editorEl.addEventListener(...args); },
+};
+
+// Insert text at the caret (replacing the selection), like a textarea paste.
+function insertText(md){
+  const {start: s, end} = getSel();
+  const val = editor.value;
+  editor.value = val.slice(0, s) + md + val.slice(end);
+  editor.setSelectionRange(s + md.length, s + md.length);
+  saveCurrentSlide(); updateAll(); scheduleSync();
+}
+function removeImgLine(d){
+  d.remove();
+  if(!editorEl.firstChild) editorEl.appendChild(makeLine(""));
+  saveCurrentSlide(); updateAll(); scheduleSync();
+}
+
 const slideTabsEl  = document.getElementById("slide-tabs");
 const slideCounter = document.getElementById("slide-counter");
 const wcNum        = document.getElementById("wc-num");
@@ -831,6 +1403,7 @@ function setMode(m) {
   setBtnState(document.getElementById("fb-connect-btn"),"idle");
   setBtnState(document.getElementById("ws-connect-btn"),"idle");
   if (m==="local") { disconnectWS(); stopFbPoll(); stopPresence(); }
+  hideRemoteBar();
   localStorage.setItem("overlay-mode", m);
 }
 
@@ -855,7 +1428,7 @@ function updateAll() { updateHighlight(); renderTabs(); updateStats(); }
 function updateStats() {
   const n=currentSlide+1, t=slides.length;
   slideCounter.textContent=`${n} / ${t}`;
-  const w=(editor.value.trim().match(/\S+/g)||[]).length;
+  const w=(editor.value.replace(IMG_TOKEN_RE,"").trim().match(/\S+/g)||[]).length;
   wcNum.textContent=w;
 }
 function renderTabs() {
@@ -878,6 +1451,7 @@ function renderTabs() {
   if(active) active.scrollIntoView({behavior:"smooth",inline:"nearest",block:"nearest"});
 }
 function loadContent(text) {
+  text=collapseImages(text);   // base64 image lines → short img:N tokens for display
   const parts=text.split(/\n---\n/).map(s=>s.trim());
   slides=parts.filter((s,i)=>s!==""||i===0);
   if(!slides.length) slides=[""];
@@ -887,19 +1461,17 @@ function loadContent(text) {
 
 // ── HIGHLIGHT ─────────────────────────────────────────────────────────────────
 function esc(s){ return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
-function highlightLine(r) {
-  const e=esc(r);
-  if(/^# /.test(r))    return `<span class="hl-h1">${e}</span>`;
-  if(/^## /.test(r))   return `<span class="hl-h2">${e}</span>`;
-  if(/^[-*] /.test(r)) return `<span class="hl-bullet">${e}</span>`;
-  if(/^> /.test(r))    return `<span class="hl-prompt">${e}</span>`;
-  const b=e.replace(/\*\*(.+?)\*\*/g,'<span class="hl-bold">**$1**</span>');
-  return `<span class="hl-body">${b}</span>`;
-}
+// Re-style lines (and fold the browser's ad-hoc editing DOM back into one div
+// per line) without moving the caret. Skipped mid-composition so mobile IMEs
+// aren't interrupted; compositionend catches up.
 function updateHighlight() {
-  hlLayer.innerHTML=editor.value.split("\n").map(highlightLine).join("\n")+"\n";
+  if(composing) return;
+  const keep = selInEditor() ? getSel() : null;
+  renderLines(domText(editorEl));
+  if(keep) setSel(keep.start, keep.end);
 }
-editor.addEventListener("scroll",()=>{ hlLayer.scrollTop=editor.scrollTop; hlLayer.scrollLeft=editor.scrollLeft; });
+editorEl.addEventListener("compositionstart", () => { composing = true; });
+editorEl.addEventListener("compositionend",   () => { composing = false; updateHighlight(); });
 
 // ── TYPING GLOW ───────────────────────────────────────────────────────────────
 editor.addEventListener("focus",()=>notesCard.classList.add("typing"));
@@ -921,18 +1493,37 @@ function nodeToMd(node) {
     case"p":  return kids.trim()?kids.trim()+"\n\n":"";
     case"div":return kids.trim()?kids.trim()+"\n":"";
     case"br": return"\n";
+    // embed only already-inlined images (data: URLs); skip remote/broken srcs
+    case"img": return (node.src||"").startsWith("data:") ? `\n![image](${node.src})\n` : "";
     default:  return kids;
   }
 }
 editor.addEventListener("paste",e=>{
-  const html=e.clipboardData.getData("text/html"); if(!html) return;
+  // Pasted bitmap (screenshot / copied photo) → embed it as an image
+  const items=(e.clipboardData&&e.clipboardData.items)||[];
+  for(const it of items){
+    if(it.type&&it.type.startsWith("image/")){
+      const file=it.getAsFile();
+      if(file){ e.preventDefault(); handleImageFile(file); return; }
+    }
+  }
+  // Always insert as markdown text ourselves — never let the browser paste raw
+  // HTML into the contenteditable.
   e.preventDefault();
-  const div=document.createElement("div"); div.innerHTML=html;
-  const md=nodeToMd(div).replace(/\n{3,}/g,"\n\n").trim();
-  const s=editor.selectionStart,end=editor.selectionEnd;
-  editor.value=editor.value.slice(0,s)+md+editor.value.slice(end);
-  editor.selectionStart=editor.selectionEnd=s+md.length;
-  saveCurrentSlide(); updateAll(); scheduleSync();
+  const plain = e.clipboardData?.getData("text/plain") || "";
+  const html  = e.clipboardData?.getData("text/html");
+  let md;
+  if(plain.includes("](data:image/") || !html) md = plain.replace(/\r\n?/g, "\n");
+  else { const div=document.createElement("div"); div.innerHTML=html;
+         md = nodeToMd(div).replace(/\n{3,}/g,"\n\n").trim(); }
+  if(md) insertText(collapseImages(md));
+});
+editor.addEventListener("drop", e => {
+  e.preventDefault();
+  const f = [...(e.dataTransfer?.files || [])].find(f => f.type.startsWith("image/"));
+  if(f){ handleImageFile(f); return; }
+  const t = e.dataTransfer?.getData("text/plain");
+  if(t) insertText(collapseImages(t.replace(/\r\n?/g, "\n")));
 });
 
 // ── TOOLBAR ───────────────────────────────────────────────────────────────────
@@ -958,14 +1549,82 @@ function insertBold() {
 function insertHeading(n) { insertAtLineStart("#".repeat(n)+" "); }
 function insertBullet()   { insertAtLineStart("- "); }
 function insertPrompt()   { insertAtLineStart("> "); }
+// Toolbar taps must not steal focus (and the caret) from the editor.
+document.querySelectorAll(".tool-btn").forEach(b =>
+  b.addEventListener("mousedown", e => e.preventDefault()));
 
-editor.addEventListener("input",()=>{ lastTypedAt=Date.now(); saveCurrentSlide(); updateAll(); scheduleSync(); });
+// ── IMAGES ──────────────────────────────────────────────────────────────────
+// Photos ride the existing Firebase / local sync channel as a downscaled data-URL
+// image line (![image](data:...)) — no extra upload endpoint — and render in the
+// desktop overlay. In the editor the token line renders as the photo itself
+// (see EDITOR above); its ✕ button removes it.
+const IMG_MAX_W = 1000;   // downscale wider images to this before embedding
+const IMG_QUALITY = 0.82; // JPEG quality for the embedded copy
+
+function pickImage(){ document.getElementById("img-input").click(); }
+
+// Draw onto a canvas at a capped width and return a compact data URL.
+function compressImage(img){
+  const scale = Math.min(1, IMG_MAX_W / img.naturalWidth);
+  const w = Math.max(1, Math.round(img.naturalWidth  * scale));
+  const h = Math.max(1, Math.round(img.naturalHeight * scale));
+  const cv = document.createElement("canvas");
+  cv.width = w; cv.height = h;
+  cv.getContext("2d").drawImage(img, 0, 0, w, h);
+  return cv.toDataURL("image/jpeg", IMG_QUALITY);
+}
+
+function insertImageData(dataUrl){
+  const s = editor.selectionStart, val = editor.value;
+  const before = val.slice(0, s), after = val.slice(s);
+  // keep the image on its own line for clean rendering in the overlay
+  const lead = (before === "" || before.endsWith("\n")) ? "" : "\n";
+  const id   = registerImage(dataUrl);
+  const md   = lead + `![photo ${id}](img:${id})\n`;
+  editor.value = before + md + after;
+  const caret = (before + md).length;
+  editor.selectionStart = editor.selectionEnd = caret;
+  saveCurrentSlide(); updateAll(); scheduleSync(); editor.focus();
+}
+
+function handleImageFile(file){
+  if(!file || !file.type || !file.type.startsWith("image/")){
+    alert("That doesn't look like an image file."); return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const img = new Image();
+    img.onload  = () => { try { insertImageData(compressImage(img)); }
+                          catch(err){ alert("Could not process that image."); } };
+    img.onerror = () => alert("Could not read that image.");
+    img.src = reader.result;
+  };
+  reader.onerror = () => alert("Could not read that file.");
+  reader.readAsDataURL(file);
+}
+
+editor.addEventListener("input",()=>{
+  lastTypedAt=Date.now();
+  // plain-text paste / drop of a raw ![..](data:...) line → collapse to a token
+  if(editor.value.includes("](data:image/")){
+    const oldVal = editor.value;
+    const c = editor.selectionStart;
+    const newVal = collapseImages(oldVal);
+    if(newVal !== oldVal){
+      const beforeOld = oldVal.slice(0, c);
+      const beforeNew = collapseImages(beforeOld);
+      editor.value = newVal;
+      editor.selectionStart = editor.selectionEnd = Math.min(beforeNew.length, newVal.length);
+    }
+  }
+  saveCurrentSlide(); updateAll(); scheduleSync();
+});
 
 // ── SYNC ──────────────────────────────────────────────────────────────────────
 function scheduleSync() {
   clearTimeout(debounceTimer);
   debounceTimer=setTimeout(()=>{
-    const text=slides.join("\n---\n");
+    const text=serialize();   // img:N tokens → full data URLs for the overlay
     if     (mode==="firebase"&&getDbUrl()) fbWrite(text);
     else if(mode==="local"&&ws?.readyState===WebSocket.OPEN) ws.send(text);
   },150);
@@ -988,6 +1647,7 @@ async function fbConnect(){
     localStorage.setItem("overlay-fb-url",url);
     startFbPoll();
     startPresence();
+    showRemoteBar();
     setTimeout(collapseTop, 900);
   } catch { setStatus("error","FAILED"); setBtnState(btn,"failed"); }
 }
@@ -1001,8 +1661,41 @@ function setBtnState(btn,state){
   else if(state==="failed"){ btn.classList.add("is-failed"); btn.textContent="Retry Connection"; }
   else { btn.textContent="Establish Connection"; }
 }
-function startFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=setInterval(fbPoll,800); }
-function stopFbPoll(){ clearInterval(fbPollTimer); fbPollTimer=null; }
+// Overlay edits arrive over Firebase's push stream (EventSource) the moment
+// they're written; the slow poll is only a safety net if the stream drops.
+let fbStream = null, fbPendingTimer = null;
+const recentWrites = [];     // our last few PUTs — their echoes must never reload the editor
+function startFbPoll(){
+  stopFbPoll();
+  const url=getDbUrl(); if(!url) return;
+  if(window.EventSource){
+    fbStream = new EventSource(`${url}/overlay/content.json`);
+    fbStream.addEventListener("put", e => {
+      try { const m = JSON.parse(e.data); if(m.path === "/") applyRemote(m.data); } catch {}
+    });
+  }
+  fbPollTimer=setInterval(fbPoll, fbStream ? 5000 : 800);
+}
+function stopFbPoll(){
+  clearInterval(fbPollTimer); fbPollTimer=null;
+  clearTimeout(fbPendingTimer); fbPendingTimer=null;
+  if(fbStream){ fbStream.close(); fbStream=null; }
+}
+function applyRemote(val){
+  // ignore our own writes (incl. late echoes of older ones) and no-op refreshes
+  if(typeof val!=="string" || val===lastRemoteText || recentWrites.includes(val) || val===serialize()) return;
+  // don't yank text out mid-keystroke; re-check once typing settles.
+  // NOTE: focus alone is unreliable — a blurred browser window still reports the
+  // editor as document.activeElement, which is why we key off recent typing instead.
+  const wait = 1500 - (Date.now()-lastTypedAt);
+  if(wait > 0){
+    clearTimeout(fbPendingTimer);
+    fbPendingTimer = setTimeout(() => applyRemote(val), wait + 50);
+    return;
+  }
+  lastRemoteText=val;          // only consume once we actually apply it
+  loadContent(val);
+}
 // Presence heartbeat — lets the overlay show LIVE SYNCING only while we're actually here
 function startPresence(){ clearInterval(presenceTimer); fbBeat(); presenceTimer=setInterval(fbBeat,3000); }
 function stopPresence(){ clearInterval(presenceTimer); presenceTimer=null; }
@@ -1016,20 +1709,13 @@ async function fbPoll(){
   try{
     const r=await fetch(`${url}/overlay/content.json`);
     if(!r.ok) return;
-    const val=await r.json();
-    // ignore our own writes and no-op refreshes
-    if(typeof val!=="string" || val===lastRemoteText || val===slides.join("\n---\n")) return;
-    // don't yank text out mid-keystroke; retry on a later poll once typing settles.
-    // NOTE: focus alone is unreliable — a blurred browser window still reports the
-    // textarea as document.activeElement, which is why we key off recent typing instead.
-    if(Date.now()-lastTypedAt < 1500) return;
-    lastRemoteText=val;          // only consume once we actually apply it
-    loadContent(val);
+    applyRemote(await r.json());
   } catch {}
 }
 async function fbWrite(text){
   const url=getDbUrl(); if(!url) return;
   lastRemoteText=text;   // echo guard — don't reload our own push on next poll
+  recentWrites.push(text); if(recentWrites.length > 8) recentWrites.shift();
   try{
     const r=await fetch(`${url}/overlay/content.json`,{
       method:"PUT",headers:{"Content-Type":"application/json"},body:JSON.stringify(text)
@@ -1048,10 +1734,19 @@ function connectWS(){
   setStatus("","CONNECTING…"); setBtnState(btn,"connecting");
   try{
     ws=new WebSocket(`ws://${addr}`);
-    ws.onopen   =()=>{ setStatus("connected"); setBtnState(btn,"connected"); setTimeout(collapseTop,900); };
-    ws.onclose  =()=>{ setStatus("","DISCONNECTED"); setBtnState(btn,"idle"); ws=null; };
+    ws.onopen   =()=>{ setStatus("connected"); setBtnState(btn,"connected"); showRemoteBar(); setTimeout(collapseTop,900); };
+    ws.onclose  =()=>{ setStatus("","DISCONNECTED"); setBtnState(btn,"idle"); ws=null; hideRemoteBar(); };
     ws.onerror  =()=>{ setStatus("error","FAILED"); setBtnState(btn,"failed"); };
-    ws.onmessage=ev=>{ if(ev.data!==slides.join("\n---\n")) loadContent(ev.data); };
+    ws.onmessage=ev=>{
+      try {
+        const d = JSON.parse(ev.data);
+        if (d && d.type === "screenshot") {
+          onScreenshotReceived(d);
+          return;
+        }
+      } catch {}
+      if(ev.data!==serialize()) loadContent(ev.data);
+    };
   } catch { setStatus("error","FAILED"); setBtnState(btn,"failed"); }
 }
 function disconnectWS(){ if(ws){ ws.close(); ws=null; } }
@@ -1089,7 +1784,20 @@ const POPOVER_CONTENT = {
         <div class="step-txt">Paste the URL above and click <b>Establish Connection</b>.</div>
       </div>
     </div>
-    <div class="pop-note">Test mode rules expire after 30 days. Renew in Firebase → Rules if the connection stops working.</div>`
+    <div class="pop-note">Test mode rules expire after 30 days. Renew in Firebase → Rules if the connection stops working.</div>`,
+  "rc-pop": `
+    <div class="popover-title">CONTROL PANEL</div>
+    <p style="font-size:12px;color:var(--text-2);line-height:1.6;margin-bottom:10px">
+      Remotely control the overlay on your laptop — no mouse needed on the presenter screen.
+    </p>
+    <ul class="pop-list">
+      <li><span class="chip">◀ ▶</span> Navigate between slides</li>
+      <li><span class="chip">▲ ▼</span> Scroll within the current slide</li>
+      <li><span class="chip">A− A+</span> Adjust font size on the overlay</li>
+      <li><span class="chip gold">OPACITY</span> Control overlay transparency</li>
+      <li><span class="chip" style="background:var(--primary);color:#000">📸 SNAP</span> Capture presenter screen (Ctrl+Shift+Q) &amp; copy to clipboard</li>
+    </ul>
+    <div class="pop-note">Commands are sent over the active connection (Firebase or Local). The overlay must be connected for controls to work.</div>`
 };
 
 function togglePopover(btnEl, id) {
@@ -1107,11 +1815,15 @@ function togglePopover(btnEl, id) {
   pop.className = "popover";
   pop.innerHTML = POPOVER_CONTENT[id] || "";
 
-  // Set each property individually — don't rely on cssText
   pop.style.position = "fixed";
   pop.style.zIndex   = "600";
-  pop.style.top      = (rect.bottom + 8) + "px";
   pop.style.right    = Math.max(8, window.innerWidth - rect.right) + "px";
+  // open upward if the button is in the bottom third of the viewport
+  if (rect.top > window.innerHeight * 0.66) {
+    pop.style.bottom = (window.innerHeight - rect.top + 8) + "px";
+  } else {
+    pop.style.top = (rect.bottom + 8) + "px";
+  }
 
   document.body.appendChild(pop);
 
@@ -1137,6 +1849,84 @@ document.getElementById("conn-help-btn").addEventListener("click", function(e) {
   e.stopPropagation();
   togglePopover(this, "conn-pop");
 });
+document.getElementById("rc-help-btn").addEventListener("click", function(e) {
+  e.stopPropagation();
+  togglePopover(this, "rc-pop");
+});
+
+// ── REMOTE CONTROL ───────────────────────────────────────────────────────────
+const remoteBar    = document.getElementById("remote-bar");
+const rcOpacity    = document.getElementById("rc-opacity");
+const rcOpacityVal = document.getElementById("rc-opacity-val");
+
+function sendCmd(cmd) {
+  cmd.ts = Date.now();
+  const json = JSON.stringify(cmd);
+  if (mode === "local" && ws?.readyState === WebSocket.OPEN) {
+    ws.send(json);
+  } else if (mode === "firebase" && getDbUrl()) {
+    fetch(`${getDbUrl()}/overlay/command.json`, {
+      method: "PUT", headers: {"Content-Type": "application/json"}, body: json
+    }).catch(() => {});
+  }
+}
+
+let scrollDebounce = null;
+function onScrollSlider(el) {
+  const frac = +el.value / 100;
+  const rel = (+el.value).toFixed(1);
+  el.style.setProperty("--pct", rel + "%");
+  clearTimeout(scrollDebounce);
+  scrollDebounce = setTimeout(() => sendCmd({cmd:"scroll_to", fraction: frac}), 30);
+}
+
+// ▲ / ▼ nudge buttons (hold = keep scrolling) and mouse wheel over the SCROLL row.
+// The overlay only ever reads the LATEST command (Firebase holds one slot), so
+// movement is summed and flushed as a single "scroll" every SCROLL_FLUSH_MS.
+const SCROLL_FLUSH_MS = 220, SCROLL_STEP = 3, SCROLL_HOLD_MS = 220;
+let pendingScroll = 0, scrollFlushTimer = null, scrollHoldTimer = null;
+function queueScroll(delta) {
+  pendingScroll += delta;
+  if (scrollFlushTimer) return;
+  scrollFlushTimer = setTimeout(() => {
+    scrollFlushTimer = null;
+    const d = Math.max(-50, Math.min(50, Math.round(pendingScroll)));
+    pendingScroll = 0;
+    if (d) sendCmd({cmd: "scroll", delta: d});
+  }, SCROLL_FLUSH_MS);
+}
+function bindScrollBtn(id, dir) {
+  const b = document.getElementById(id);
+  const stop = () => { clearInterval(scrollHoldTimer); scrollHoldTimer = null; };
+  b.addEventListener("pointerdown", e => {
+    e.preventDefault(); stop();
+    queueScroll(dir * SCROLL_STEP);
+    scrollHoldTimer = setInterval(() => queueScroll(dir * SCROLL_STEP), SCROLL_HOLD_MS);
+  });
+  ["pointerup", "pointerleave", "pointercancel", "blur"].forEach(t => b.addEventListener(t, stop));
+}
+bindScrollBtn("rc-scroll-up", -1);
+bindScrollBtn("rc-scroll-down", 1);
+document.querySelector(".rc-slider-group:has(#rc-scroll)").addEventListener("wheel", e => {
+  e.preventDefault();
+  queueScroll(Math.sign(e.deltaY) * Math.max(1, Math.round(Math.abs(e.deltaY) / 40)));
+}, {passive: false});
+
+let opacityDebounce = null;
+function onOpacitySlider(el) {
+  const v = +el.value;
+  rcOpacityVal.textContent = v + "%";
+  const rel = ((v - 20) / 80 * 100).toFixed(1);
+  el.style.setProperty("--pct", rel + "%");
+  clearTimeout(opacityDebounce);
+  opacityDebounce = setTimeout(() => sendCmd({cmd:"opacity", value: v}), 60);
+}
+
+function showRemoteBar() { remoteBar.classList.add("visible"); }
+function hideRemoteBar() { remoteBar.classList.remove("visible"); }
+
+// init slider track fill
+(function(){ const rel = ((93 - 20) / 80 * 100).toFixed(1); rcOpacity.style.setProperty("--pct", rel + "%"); })();
 
 // ── INIT ──────────────────────────────────────────────────────────────────────
 const savedMode   = localStorage.getItem("overlay-mode")    || "firebase";
@@ -1151,6 +1941,220 @@ updateAll();
 
 if      (savedMode==="firebase" && savedFbUrl)   fbConnect();
 else if (savedMode==="local"    && savedWsAddr)   connectWS();
+
+// ── SCREENSHOT CAPTURE & CLIPBOARD ────────────────────────────────────────────
+let isSnapping = false;
+let currentShotReqId = null;
+let currentShotDataUrl = null;
+let shotPollTimer = null;
+
+function updateScreenshotBtnState(state) {
+  const rcBtn = document.getElementById("rc-screenshot-btn");
+  const hdrBtn = document.getElementById("hdr-screenshot-btn");
+  const txt = document.getElementById("rc-shot-text");
+
+  if (state === "snapping") {
+    if (rcBtn) rcBtn.classList.add("is-snapping");
+    if (hdrBtn) hdrBtn.classList.add("is-snapping");
+    if (txt) txt.textContent = "Snapping Screen…";
+  } else if (state === "success") {
+    if (rcBtn) rcBtn.classList.remove("is-snapping");
+    if (hdrBtn) hdrBtn.classList.remove("is-snapping");
+    if (txt) txt.textContent = "Copied to Clipboard! ✓";
+    setTimeout(() => { if (txt && !isSnapping) txt.textContent = "Take Screenshot"; }, 2500);
+  } else {
+    if (rcBtn) rcBtn.classList.remove("is-snapping");
+    if (hdrBtn) hdrBtn.classList.remove("is-snapping");
+    if (txt) txt.textContent = "Take Screenshot";
+  }
+}
+
+async function triggerScreenshot() {
+  if (isSnapping) return;
+  const dbUrl = getDbUrl();
+  if (mode === "firebase" && !dbUrl) {
+    showToast("⚠️ Connect to Firebase first", "warn");
+    return;
+  }
+  if (mode === "local" && (!ws || ws.readyState !== WebSocket.OPEN)) {
+    showToast("⚠️ Connect to Local Bridge first", "warn");
+    return;
+  }
+
+  isSnapping = true;
+  updateScreenshotBtnState("snapping");
+  showToast("📸 Capturing presenter screen…", "info");
+
+  const reqId = "shot_" + Date.now() + "_" + Math.random().toString(36).substring(2, 6);
+  currentShotReqId = reqId;
+
+  sendCmd({ cmd: "screenshot", req_id: reqId });
+
+  if (mode === "firebase") {
+    pollForScreenshot(dbUrl, reqId);
+  } else if (mode === "local") {
+    clearTimeout(shotPollTimer);
+    shotPollTimer = setTimeout(() => {
+      if (isSnapping && currentShotReqId === reqId) {
+        isSnapping = false;
+        updateScreenshotBtnState("idle");
+        showToast("❌ Screenshot timed out (is overlay running?)", "error");
+      }
+    }, 12000);
+  }
+}
+
+function pollForScreenshot(dbUrl, reqId) {
+  clearTimeout(shotPollTimer);
+  const start = Date.now();
+
+  async function poll() {
+    if (!isSnapping || currentShotReqId !== reqId) return;
+    if (Date.now() - start > 12000) {
+      isSnapping = false;
+      updateScreenshotBtnState("idle");
+      showToast("❌ Screenshot timed out (is overlay running?)", "error");
+      return;
+    }
+    try {
+      // Poll only the tiny req_id; download the (~150 KB) image once it's ours.
+      // Polling the whole node re-downloaded the previous screenshot every tick.
+      const idRes = await fetch(`${dbUrl}/overlay/screenshot/req_id.json`);
+      if (idRes.ok && (await idRes.json()) === reqId) {
+        const res = await fetch(`${dbUrl}/overlay/screenshot.json`);
+        const data = res.ok ? await res.json() : null;
+        if (data && data.req_id === reqId && data.image) {
+          isSnapping = false;
+          onScreenshotReceived(data);
+          return;
+        }
+      }
+    } catch (e) {
+      console.warn("[Screenshot] poll error:", e);
+    }
+    shotPollTimer = setTimeout(poll, 200);
+  }
+  poll();
+}
+
+async function onScreenshotReceived(payload) {
+  clearTimeout(shotPollTimer);
+  isSnapping = false;
+  currentShotReqId = null;
+  currentShotDataUrl = payload.image;
+  updateScreenshotBtnState("success");
+
+  let copied = false;
+  try {
+    copied = await copyImageToClipboard(payload.image);
+  } catch (err) {
+    console.warn("Direct clipboard copy failed:", err);
+  }
+
+  if (copied) {
+    // Copied straight to the clipboard: just confirm, no full-screen preview.
+    showToast("📋 Screenshot copied to clipboard! (Ctrl+V to paste)", "success");
+    return;
+  }
+  // Browser refused the automatic copy (needs a user gesture / no clipboard API):
+  // fall back to the preview so the user can tap to copy.
+  showToast("📸 Screenshot received! Tap preview to copy", "info");
+  showScreenshotPreview(payload.image, false);
+}
+
+async function copyImageToClipboard(dataUrl) {
+  return new Promise((resolve) => {
+    if (!navigator.clipboard || typeof navigator.clipboard.write !== "function" || typeof ClipboardItem === "undefined") {
+      resolve(false);
+      return;
+    }
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      try {
+        const canvas = document.createElement("canvas");
+        canvas.width = img.naturalWidth || img.width;
+        canvas.height = img.naturalHeight || img.height;
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0);
+        canvas.toBlob(async (blob) => {
+          if (!blob) { resolve(false); return; }
+          try {
+            await navigator.clipboard.write([
+              new ClipboardItem({ "image/png": blob })
+            ]);
+            resolve(true);
+          } catch (e) {
+            console.warn("ClipboardItem write failed:", e);
+            resolve(false);
+          }
+        }, "image/png");
+      } catch (e) {
+        resolve(false);
+      }
+    };
+    img.onerror = () => resolve(false);
+    img.src = dataUrl;
+  });
+}
+
+function showScreenshotPreview(dataUrl, copied) {
+  const modal = document.getElementById("shot-modal");
+  const imgEl = document.getElementById("shot-preview-img");
+  const badge = document.getElementById("modal-status-badge");
+  if (!modal || !imgEl) return;
+
+  imgEl.src = dataUrl;
+  if (badge) {
+    badge.textContent = copied ? "✓ Automatically copied to system clipboard" : "⚠️ Click below to copy to clipboard";
+    badge.style.color = copied ? "var(--green)" : "var(--gold)";
+  }
+  modal.classList.add("open");
+}
+
+function closeShotModal() {
+  const modal = document.getElementById("shot-modal");
+  if (modal) modal.classList.remove("open");
+}
+
+async function reCopyScreenshot() {
+  if (!currentShotDataUrl) return;
+  const btn = document.getElementById("modal-copy-btn");
+  if (btn) btn.textContent = "Copying…";
+  const ok = await copyImageToClipboard(currentShotDataUrl);
+  if (btn) btn.textContent = ok ? "Copied! ✓" : "Failed to copy";
+  if (ok) showToast("📋 Screenshot copied to clipboard!", "success");
+  setTimeout(() => { if (btn) btn.textContent = "📋 Copy to Clipboard"; }, 2000);
+}
+
+function downloadScreenshot() {
+  if (!currentShotDataUrl) return;
+  const a = document.createElement("a");
+  a.href = currentShotDataUrl;
+  a.download = `presenter-screen-${Date.now()}.jpg`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast("⬇ Screenshot downloaded", "info");
+}
+
+function showToast(msg, type = "info") {
+  const box = document.getElementById("toast-box");
+  if (!box) return;
+  const t = document.createElement("div");
+  t.className = `toast-msg ${type}`;
+  t.textContent = msg;
+  box.appendChild(t);
+  setTimeout(() => { if (t.parentNode) t.remove(); }, 4000);
+}
+
+// Global shortcut: Ctrl + Shift + Q (or Cmd + Shift + Q on macOS)
+window.addEventListener("keydown", (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.shiftKey && (e.key === "Q" || e.key === "q")) {
+    e.preventDefault();
+    triggerScreenshot();
+  }
+});
 </script>
 </body>
 </html>
